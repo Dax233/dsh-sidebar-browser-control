@@ -1,0 +1,3 @@
+- insert:
+    - id: sidebar-browser-control
+      name: '@local/dsh-sidebar-browser-control'

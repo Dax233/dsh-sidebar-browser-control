@@ -1,0 +1,51 @@
+{
+  "name": "@local/dsh-sidebar-browser-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sidebar Agent Browser for DeepSeek Harness: an owned webview plus Agent tools (snapshot/click/type/scroll) driven through a loopback bridge, with an in-page virtual cursor that never moves the user's real mouse.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "bridge.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "docs/**"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-session"
+      ]
+    }
+  },
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "test": "node --test tests/bridge.test.mjs tests/browser-control-client.test.mjs tests/browser-control-host.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dax233/dsh-sidebar-browser-control.git"
+  },
+  "homepage": "https://github.com/Dax233/dsh-sidebar-browser-control#readme",
+  "bugs": {
+    "url": "https://github.com/Dax233/dsh-sidebar-browser-control/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

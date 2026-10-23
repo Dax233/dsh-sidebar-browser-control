@@ -1,0 +1,295 @@
+/**
+ * Test harness that executes the real browser bundle (client.js) inside a Node
+ * VM with mocked browser globals. This is what lets us catch boot-breaking
+ * regressions (e.g. apply() returning a never-settling promise) before the
+ * bundle is ever installed into the desktop app.
+ */
+import { readFileSync } from "node:fs";
+import { createContext, runInContext } from "node:vm";
+
+/** Minimal AbortSignal/Controller pair for the VM: no timers, so tests exit fast. */
+function createFakeSignal() {
+  const listeners = [];
+  const signal = {
+    aborted: false,
+    reason: undefined,
+    addEventListener(type, callback) {
+      if (type === "abort") listeners.push(callback);
+    },
+    removeEventListener(type, callback) {
+      const index = listeners.indexOf(callback);
+      if (index >= 0) listeners.splice(index, 1);
+    },
+    throwIfAborted() {
+      if (signal.aborted) throw signal.reason ?? new Error("aborted");
+    },
+    _abort(reason) {
+      if (signal.aborted) return;
+      signal.aborted = true;
+      signal.reason = reason;
+      for (const callback of [...listeners]) {
+        try {
+          callback();
+        } catch {
+          // Listeners must not break the abort path.
+        }
+      }
+    },
+  };
+  return signal;
+}
+
+class FakeAbortController {
+  constructor() {
+    this.signal = createFakeSignal();
+  }
+
+  abort(reason) {
+    this.signal._abort(reason);
+  }
+}
+
+const FakeAbortSignal = {
+  timeout() {
+    // Deadlines are irrelevant inside unit tests; never create a timer.
+    return createFakeSignal();
+  },
+  any(signals) {
+    const controller = new FakeAbortController();
+    for (const signal of signals) {
+      if (signal.aborted) controller.abort(signal.reason);
+      else signal.addEventListener("abort", () => controller.abort(signal.reason));
+    }
+    return controller.signal;
+  },
+};
+
+function makeElement(tag = "div") {
+  const listeners = new Map();
+  const element = {
+    tagName: String(tag).toUpperCase(),
+    style: {},
+    children: [],
+    dataset: {},
+    attributes: {},
+    listeners,
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+    },
+    getAttribute(name) {
+      return this.attributes[name] ?? null;
+    },
+    addEventListener(type, callback) {
+      const list = listeners.get(type) ?? [];
+      list.push(callback);
+      listeners.set(type, list);
+    },
+    removeEventListener(type, callback) {
+      const list = listeners.get(type) ?? [];
+      listeners.set(
+        type,
+        list.filter((entry) => entry !== callback),
+      );
+    },
+    /** Deliver one event to every listener registered for the type (tests only). */
+    dispatch(type, event = {}) {
+      for (const callback of [...(listeners.get(type) ?? [])]) callback(event);
+    },
+    remove() {},
+    attachShadow() {
+      return makeElement("shadow");
+    },
+    focus() {},
+    innerHTML: "",
+    className: "",
+  };
+  return element;
+}
+
+/**
+ * Load one bundle file and return its registered module definition plus mocks.
+ *
+ * @param {string} clientFile absolute path to client.js
+ * @param {object} [options]
+ * @param {(call: {url: string, init: object}) => object | Promise<object>} [options.respond]
+ *        returns a fetch-like response; the default answers /hello and then holds /poll forever.
+ */
+export function loadClientBundle(clientFile, options = {}) {
+  const registrations = [];
+  const fetchCalls = [];
+  const timers = [];
+  const cleanups = [];
+  const elements = [];
+  let timerId = 1;
+
+  const respond = options.respond ?? defaultResponder(fetchCalls);
+
+  const fetchMock = (url, init = {}) => {
+    const call = { url: String(url), init, at: Date.now() };
+    fetchCalls.push(call);
+    if (init.signal?.aborted === true) {
+      return Promise.reject(Object.assign(new Error("fetch aborted"), { name: "AbortError" }));
+    }
+    try {
+      return Promise.resolve(respond(call));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+
+  const document = {
+    createElement: (tag) => {
+      const element = makeElement(tag);
+      if (String(tag).toLowerCase() === "webview" && options.webview !== undefined) {
+        const supplied = typeof options.webview === "function" ? options.webview(tag) : options.webview;
+        if (supplied !== undefined) Object.assign(element, supplied);
+      }
+      elements.push(element);
+      return element;
+    },
+    getElementById: () => null,
+    documentElement: makeElement("html"),
+    body: makeElement("body"),
+  };
+
+  const sandbox = {
+    window: { __ModuleLoader__: { load: (definition) => registrations.push(definition) } },
+    document,
+    location: { href: "dsh-app://app/", origin: "dsh-app://app" },
+    navigator: { userAgent: "dsh-test-agent" },
+    console: { log() {}, warn() {}, error() {} },
+    fetch: fetchMock,
+    AbortSignal: FakeAbortSignal,
+    AbortController: FakeAbortController,
+    URL,
+    URLSearchParams,
+    setTimeout: (fn, ms) => {
+      const id = timerId++;
+      timers.push({ id, fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => {
+      const index = timers.findIndex((timer) => timer.id === id);
+      if (index >= 0) timers.splice(index, 1);
+    },
+    require: (id) => requireMock(id),
+  };
+  sandbox.globalThis = sandbox;
+  if (options.dshDesktop !== undefined) sandbox.dshDesktop = options.dshDesktop;
+  if (options.notification !== undefined) sandbox.Notification = options.notification;
+
+  const context = createContext(sandbox);
+  runInContext(readFileSync(clientFile, "utf8"), context, { filename: clientFile });
+  if (registrations.length !== 1) {
+    throw new Error(`expected exactly one __ModuleLoader__.load registration, got ${registrations.length}`);
+  }
+  const definition = registrations[0];
+  const plugin = definition.factory((id) => requireMock(id));
+
+  /** Run every pending setTimeout callback once (retry paths). */
+  const flushTimers = () => {
+    const pending = timers.splice(0);
+    for (const timer of pending) timer.fn();
+    return pending.length;
+  };
+
+  /** Minimal Cordis client context capturing registrations and disposers. */
+  const makeContext = (overrides = {}) => {
+    const tabTypes = [];
+    const slotInjections = [];
+    const slotRegistrations = [];
+    const openTabCalls = [];
+    const effectDisposers = [];
+    const ctx = {
+      effect(execute) {
+        const dispose = execute();
+        if (typeof dispose === "function") effectDisposers.push(dispose);
+        return dispose;
+      },
+      sidebarRightTabs: {
+        register(configuration) {
+          tabTypes.push(configuration);
+          return () => {};
+        },
+      },
+      sidebarRight: {
+        openTab(...args) {
+          openTabCalls.push(args);
+          if (overrides.openTab) return overrides.openTab(...args);
+          return undefined;
+        },
+      },
+      slots: {
+        inject(name, callback) {
+          const registration = callback();
+          slotInjections.push({ name, registration });
+          return () => {};
+        },
+        register(configuration, component) {
+          slotRegistrations.push({ configuration, component });
+          return () => {};
+        },
+      },
+      locale: { bind: () => (key) => key, register: () => () => {} },
+    };
+    return {
+      ctx,
+      tabTypes,
+      slotInjections,
+      slotRegistrations,
+      openTabCalls,
+      effectDisposers,
+      disposeAll() {
+        for (const dispose of effectDisposers.splice(0).reverse()) dispose();
+      },
+    };
+  };
+
+  return {
+    definition,
+    plugin,
+    context,
+    fetchCalls,
+    timers,
+    elements,
+    cleanups,
+    flushTimers,
+    makeContext,
+  };
+}
+
+function requireMock(id) {
+  if (id === "react") {
+    return {
+      createElement: () => null,
+      useRef: () => ({ current: null }),
+      useEffect: () => {},
+      useState: () => [undefined, () => {}],
+    };
+  }
+  throw new Error(`unexpected client require("${id}")`);
+}
+
+/** Answer /hello, then keep /poll pending so the bridge loop stays alive. */
+function defaultResponder(fetchCalls) {
+  return (call) => {
+    if (call.url.includes("/hello")) {
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+    if (call.url.includes("/poll")) {
+      return new Promise(() => {});
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+}
+
+/** Let queued promise chains (fetch/json/handle) settle. */
+export function flushMicrotasks(rounds = 8) {
+  let chain = Promise.resolve();
+  for (let i = 0; i < rounds; i += 1) chain = chain.then(() => undefined);
+  return chain;
+}
