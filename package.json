@@ -33,7 +33,7 @@
       ]
     }
   },
-  "license": "AGPL-3.0-or-later",
+  "license": "MIT",
   "scripts": {
     "test": "node --test tests/bridge.test.mjs tests/browser-control-client.test.mjs tests/browser-control-host.test.mjs"
   },
