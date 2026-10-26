@@ -868,25 +868,82 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Convert a captured image to a data URL. Electron's NativeImage exposes
-     * toPNG()/toJPEG(quality); toDataURL() is the fallback some mocks provide.
+     * Extract a PNG data URL from an Electron NativeImage.
+     *
+     * The DSH renderer is sandboxed (no Node integration): `nativeImage.toPNG()`
+     * throws "Buffer is not available for the current Context" there because
+     * Electron cannot allocate a Node Buffer in the page world (observed on a
+     * real session, 2026-10-26). `toDataURL()` is context-safe and must be
+     * preferred; toPNG() stays as a fallback for contexts that do have Node.
      */
-    function imageToDataUrl(image, format, quality) {
+    function nativeImageToPngDataUrl(image) {
       if (image === undefined || image === null) throw new Error("capturePage did not return an image");
-      const requested = format === "jpeg" ? "jpeg" : "png";
-      if (requested === "jpeg" && typeof image.toJPEG === "function") {
-        const bytes = image.toJPEG(Math.max(1, Math.min(100, Number(quality ?? 80))));
-        if (bytes && bytes.length > 0) return `data:image/jpeg;base64,${bytesToBase64(bytes)}`;
+      if (typeof image.toDataURL === "function") {
+        try {
+          const dataUrl = image.toDataURL();
+          if (typeof dataUrl === "string" && dataUrl.startsWith("data:image/")) return dataUrl;
+        } catch {
+          // Fall through to the Buffer-based paths.
+        }
       }
       if (typeof image.toPNG === "function") {
-        const bytes = image.toPNG();
-        if (bytes && bytes.length > 0) return `data:image/png;base64,${bytesToBase64(bytes)}`;
-      }
-      if (typeof image.toDataURL === "function") {
-        const dataUrl = image.toDataURL();
-        if (typeof dataUrl === "string" && dataUrl.startsWith("data:image/")) return dataUrl;
+        try {
+          const bytes = image.toPNG();
+          if (bytes && bytes.length > 0) return `data:image/png;base64,${bytesToBase64(bytes)}`;
+        } catch {
+          // Sandboxed renderer without Buffer.
+        }
       }
       throw new Error("capturePage did not return an image");
+    }
+
+    /** Convert a PNG data URL to JPEG with a canvas (toJPEG is also unsafe in the sandbox). */
+    async function pngDataUrlToJpeg(dataUrl, quality) {
+      const documentRef = globalThis.document;
+      const ImageCtor = globalThis.Image;
+      if (documentRef === undefined || typeof documentRef.createElement !== "function" || typeof ImageCtor !== "function") {
+        throw new Error("JPEG screenshots need the renderer canvas/Image APIs");
+      }
+      const image = new ImageCtor();
+      image.src = dataUrl;
+      if (typeof image.decode === "function") await image.decode();
+      else {
+        await new Promise((resolve, reject) => {
+          image.onload = resolve;
+          image.onerror = () => reject(new Error("the captured image could not be decoded"));
+        });
+      }
+      const canvas = documentRef.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(Number(image.naturalWidth || image.width || 1)));
+      canvas.height = Math.max(1, Math.round(Number(image.naturalHeight || image.height || 1)));
+      const context = typeof canvas.getContext === "function" ? canvas.getContext("2d") : undefined;
+      if (!context || typeof context.drawImage !== "function") throw new Error("JPEG screenshots need a 2D canvas");
+      context.drawImage(image, 0, 0);
+      const converted = canvas.toDataURL("image/jpeg", Math.max(1, Math.min(100, Number(quality ?? 80))) / 100);
+      if (typeof converted !== "string" || !converted.startsWith("data:image/jpeg")) {
+        throw new Error("JPEG conversion produced no image");
+      }
+      return converted;
+    }
+
+    /**
+     * Convert a captured image to a data URL, preferring the context-safe paths.
+     * JPEG first tries toJPEG() (fast, quality honoured) and falls back to a
+     * canvas re-encode when the sandboxed renderer cannot use Node Buffers.
+     */
+    async function imageToDataUrl(image, format, quality) {
+      const requested = format === "jpeg" ? "jpeg" : "png";
+      if (requested === "jpeg" && image !== undefined && image !== null && typeof image.toJPEG === "function") {
+        try {
+          const bytes = image.toJPEG(Math.max(1, Math.min(100, Number(quality ?? 80))));
+          if (bytes && bytes.length > 0) return `data:image/jpeg;base64,${bytesToBase64(bytes)}`;
+        } catch {
+          // Sandboxed renderer: fall back to canvas conversion.
+        }
+      }
+      const png = nativeImageToPngDataUrl(image);
+      if (requested === "png") return png;
+      return pngDataUrlToJpeg(png, quality);
     }
 
     /** Clamp a requested clip rectangle to the real viewport (visible intersection). */
@@ -1416,20 +1473,22 @@ window.__ModuleLoader__.load({
         let targetY = 0;
         try {
           while (targetY < capturedHeight) {
-            await current.executeJavaScript(`(() => { window.scrollTo(0, ${targetY}); return 1; })()`);
+            // `behavior: 'instant'` bypasses a page's `scroll-behavior: smooth`,
+            // which would otherwise animate and make the capture frame lag.
+            await current.executeJavaScript(`(() => { window.scrollTo({ top: ${targetY}, left: 0, behavior: 'instant' }); return 1; })()`);
             await sleepImpl(60);
             const image = await withCaptureTimeout(Promise.resolve(current.capturePage()), captureTimeoutMs, "capturePage");
             // The browser clamps a scroll near the bottom; record where the
             // frame really starts so the stitched output stays aligned.
             const at = await current.executeJavaScript(scrollStateJs());
             const actualY = Math.max(0, Math.round(Number(at?.scrollY ?? targetY)));
-            segments.push({ actualY, dataUrl: imageToDataUrl(image, "png", 100) });
+            segments.push({ actualY, dataUrl: await imageToDataUrl(image, "png", 100) });
             if (actualY >= capturedHeight - viewportHeight) break;
             targetY += viewportHeight;
           }
         } finally {
           try {
-            await current.executeJavaScript(`(() => { window.scrollTo(0, ${originalScrollY}); return 1; })()`);
+            await current.executeJavaScript(`(() => { window.scrollTo({ top: ${originalScrollY}, left: 0, behavior: 'instant' }); return 1; })()`);
           } catch {
             // The page may have navigated away mid-capture.
           }
@@ -1987,7 +2046,7 @@ window.__ModuleLoader__.load({
                 captureTimeoutMs,
                 "capturePage",
               );
-              const dataUrl = imageToDataUrl(image, format, quality);
+              const dataUrl = await imageToDataUrl(image, format, quality);
               if (viewportInfo === undefined || viewportInfo === null) {
                 try {
                   viewportInfo = await current.executeJavaScript(viewportInfoJs());

@@ -105,6 +105,11 @@ browser close
   `position:fixed/sticky` elements can repeat in the stitched image. Every
   `capturePage()` call is also bounded by a timeout, so a hanging capture returns
   an error instead of freezing the panel.
+- **Screenshots use the sandbox-safe image path.** The DSH renderer has no Node
+  integration, so Electron's `nativeImage.toPNG()/toJPEG()` throw "Buffer is not
+  available for the current Context". Capture conversion therefore prefers
+  `toDataURL()`; JPEG falls back to re-encoding the PNG in a canvas when `toJPEG`
+  is unavailable (0.2.2, found on a real tab).
 - **Theme `emulate` is best-effort, not CDP emulation.** It overrides
   `matchMedia('(prefers-color-scheme: …)')` in the page and rewrites same-origin
   media rules to `all`/`not all`. Cross-origin stylesheets are unreadable by

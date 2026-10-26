@@ -389,20 +389,48 @@ test("scripts: injectBaseHref injects once, escapes, and leaves an existing base
   assert.equal(helpers.injectBaseHref("<p>x</p>", undefined).injected, false);
 });
 
-test("scripts: bytesToBase64 matches Buffer, and imageToDataUrl handles PNG/JPEG/fallbacks", () => {
+test("scripts: bytesToBase64 matches Buffer, and imageToDataUrl prefers context-safe capture paths", async () => {
   const bytes = Uint8Array.from([0, 1, 2, 3, 250, 251, 252, 42]);
   assert.equal(helpers.bytesToBase64(bytes), Buffer.from(bytes).toString("base64"));
   assert.equal(helpers.bytesToBase64(Uint8Array.from([])), "");
   assert.equal(
-    helpers.imageToDataUrl({ toPNG: () => Uint8Array.from([1, 2, 3]) }, "png", 80),
+    await helpers.imageToDataUrl({ toPNG: () => Uint8Array.from([1, 2, 3]) }, "png", 80),
     `data:image/png;base64,${Buffer.from([1, 2, 3]).toString("base64")}`,
   );
   assert.equal(
-    helpers.imageToDataUrl({ toJPEG: () => Uint8Array.from([9, 8, 7]) }, "jpeg", 90),
+    await helpers.imageToDataUrl({ toJPEG: () => Uint8Array.from([9, 8, 7]) }, "jpeg", 90),
     `data:image/jpeg;base64,${Buffer.from([9, 8, 7]).toString("base64")}`,
   );
-  assert.equal(helpers.imageToDataUrl({ toDataURL: () => "data:image/png;base64,AAAA" }, "png", 80), "data:image/png;base64,AAAA");
-  assert.throws(() => helpers.imageToDataUrl({}, "png", 80), /did not return an image/);
+  assert.equal(
+    await helpers.imageToDataUrl({ toDataURL: () => "data:image/png;base64,AAAA" }, "png", 80),
+    "data:image/png;base64,AAAA",
+  );
+  await assert.rejects(() => helpers.imageToDataUrl({}, "png", 80), /did not return an image/);
+
+  // Real DSH Desktop renderer: nativeImage.toPNG/toJPEG throw "Buffer is not
+  // available for the current Context", toDataURL works. Captures must still work.
+  const sandboxedPng = await helpers.imageToDataUrl(
+    {
+      toDataURL: () => "data:image/png;base64,AAAA",
+      toPNG: () => {
+        throw new Error("Buffer is not available for the current Context");
+      },
+    },
+    "png",
+    80,
+  );
+  assert.equal(sandboxedPng, "data:image/png;base64,AAAA");
+  const sandboxedJpeg = await helpers.imageToDataUrl(
+    {
+      toDataURL: () => "data:image/png;base64,AAAA",
+      toJPEG: () => {
+        throw new Error("Buffer is not available for the current Context");
+      },
+    },
+    "jpeg",
+    60,
+  );
+  assert.match(sandboxedJpeg, /^data:image\/jpeg;base64,/, "JPEG must fall back to a canvas re-encode");
 });
 
 test("scripts: clampRect clamps into the viewport and isBlankUrl recognises about:blank", () => {

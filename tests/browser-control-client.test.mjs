@@ -134,8 +134,8 @@ function makeWebviewMock(options = {}) {
         if (match) scrollY += Number(match[1]);
         return { scrolled: true };
       }
-      if (options.trackingScroll === true && code.includes("window.scrollTo(0,")) {
-        const match = /window\.scrollTo\(0,\s*(-?\d+(?:\.\d+)?)\)/.exec(code);
+      if (options.trackingScroll === true && code.includes("window.scrollTo({")) {
+        const match = /window\.scrollTo\(\{\s*top:\s*(-?\d+(?:\.\d+)?)/.exec(code);
         if (match) pageScroll = Math.max(0, Math.min(Number(match[1]), 900 - 742));
         return 1;
       }
@@ -883,9 +883,13 @@ test("screenshot fullPage stitches viewport captures without resizing the guest"
   assert.ok(canvas, "the stitched image must be drawn into a canvas");
   assert.equal(canvas.height, 900);
   assert.deepEqual(plain(canvas.__draws.map((draw) => draw.y)), [0, 158], "the last slice draws at the clamped bottom scroll");
-  const scrollToCalls = mounted.calls.executeJavaScript.filter((code) => code.includes("window.scrollTo"));
+  const scrollToCalls = mounted.calls.executeJavaScript.filter((code) => code.includes("window.scrollTo({"));
   assert.ok(scrollToCalls.length >= 3);
-  assert.match(scrollToCalls.at(-1), /scrollTo\(0, 120\)/, "the original scroll position must be restored");
+  assert.match(
+    scrollToCalls.at(-1),
+    /window\.scrollTo\(\{ top: 120, left: 0, behavior: 'instant' \}\)/,
+    "the original scroll position must be restored, bypassing page smooth scrolling",
+  );
   mounted.controller.unmount();
 
   const capped = await mountController({
