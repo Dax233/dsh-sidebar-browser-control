@@ -259,3 +259,40 @@ test("bridge: a timed-out queued command is never replayed into a later poll", a
     bridge.close();
   }
 });
+
+test("bridge: a per-command timeout override expires sooner than the bridge-wide timeout", async () => {
+  const bridge = makeBridge({ commandTimeoutMs: 60_000 });
+  await bridge.start();
+  try {
+    const started = Date.now();
+    await assert.rejects(() => bridge.pushCommand({ type: "slow-batch" }, 80), /timeout/);
+    assert.ok(Date.now() - started < 5000, "the override must not wait for the bridge-wide timeout");
+    assert.equal(bridge.queue.length, 0);
+    assert.equal(bridge.pending.size, 0);
+  } finally {
+    bridge.close();
+  }
+});
+
+test("bridge: a per-command timeout override also extends the stale queue window", async () => {
+  const bridge = makeBridge({ commandTimeoutMs: 80, pollTimeoutMs: 500 });
+  const port = await bridge.start();
+  try {
+    const pending = bridge.pushCommand({ type: "qa-step" }, 5000);
+    // Older than the bridge-wide 80ms timeout: without the override the /poll
+    // age filter would drop it as stale.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const response = await authed(port, "/poll?client=qa");
+    const payload = await response.json();
+    assert.deepEqual(payload.cmd, { type: "qa-step" }, "the override must keep the command deliverable");
+    await authed(port, `/result?id=${encodeURIComponent(payload.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: true, settled: true }),
+    });
+    const outcome = await pending;
+    assert.equal(outcome.value.ok, true);
+  } finally {
+    bridge.close();
+  }
+});

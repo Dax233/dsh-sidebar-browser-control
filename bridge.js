@@ -96,8 +96,18 @@ export function createBridge(options) {
     return state;
   }
 
-  function pushCommand(cmd) {
+  /**
+   * Queue one command for the active client.
+   *
+   * `timeoutMs` overrides the bridge-wide command timeout for this command
+   * only. Batch actions (qa) need a much longer budget for a single screenshot
+   * or navigation, while normal actions must fail fast. The override is also
+   * remembered on the queued entry so the stale-command filter in /poll uses
+   * the same deadline the command was created with.
+   */
+  function pushCommand(cmd, timeoutMs) {
     const id = `cmd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const effectiveTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : commandTimeoutMs;
     const active = activeClientId();
     let waiter;
     for (const candidate of pollWaiters) {
@@ -111,7 +121,7 @@ export function createBridge(options) {
       clearTimeout(waiter.timer);
       waiter.respond({ id, cmd });
     } else {
-      queue.push({ id, cmd, queuedAt: Date.now() });
+      queue.push({ id, cmd, queuedAt: Date.now(), timeoutMs: effectiveTimeoutMs });
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -122,8 +132,8 @@ export function createBridge(options) {
         pending.delete(id);
         writeState({ lastTimeout: id });
         reject(new Error("browser bridge: no client result before timeout"));
-      }, commandTimeoutMs);
-      pending.set(id, { resolve, timer, sentAt: Date.now() });
+      }, effectiveTimeoutMs);
+      pending.set(id, { resolve, timer, sentAt: Date.now(), timeoutMs: effectiveTimeoutMs });
     });
   }
 
@@ -249,7 +259,10 @@ export function createBridge(options) {
         while (queue.length > 0) {
           const entry = queue.shift();
           const ageMs = Date.now() - (entry.queuedAt ?? 0);
-          if (ageMs <= commandTimeoutMs) {
+          // A per-command timeout override (qa) extends how long its command
+          // may legitimately sit in the queue; never drop it early.
+          const entryTimeoutMs = Number.isFinite(entry.timeoutMs) ? entry.timeoutMs : commandTimeoutMs;
+          if (ageMs <= entryTimeoutMs) {
             json(200, entry);
             return;
           }

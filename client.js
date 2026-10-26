@@ -322,6 +322,627 @@ window.__ModuleLoader__.load({
     }
 
     // ---------------------------------------------------------------------
+    // QA page scripts (2026-10-26). Same convention: the marker comment is
+    // what the unit tests assert, and every script returns plain JSON.
+    // ---------------------------------------------------------------------
+
+    /** Actual guest viewport numbers after a resize (the real sizes, not fakes). */
+    function viewportInfoJs() {
+      return `(() => {
+        // __dshAgentViewportInfo
+        const doc = document.scrollingElement || document.documentElement;
+        return {
+          innerWidth: Math.round(window.innerWidth || 0),
+          innerHeight: Math.round(window.innerHeight || 0),
+          devicePixelRatio: window.devicePixelRatio || 1,
+          scrollWidth: Math.round(doc.scrollWidth || 0),
+          scrollHeight: Math.round(doc.scrollHeight || 0)
+        };
+      })()`;
+    }
+
+    /** Structured layout/image/font/selector measurements for action=metrics. */
+    function metricsJs(selectors = [], includeOverflow = true) {
+      return `(() => {
+        // __dshAgentMetrics
+        const wanted = ${JSON.stringify(Array.isArray(selectors) ? selectors.map(String) : [])};
+        const includeOverflow = ${includeOverflow === true};
+        const doc = document.scrollingElement || document.documentElement;
+        const describe = (el) => {
+          if (!el || !el.tagName) return '?';
+          const tag = el.tagName.toLowerCase();
+          const id = el.id ? '#' + el.id : '';
+          const cls = typeof el.className === 'string' && el.className.trim() !== ''
+            ? '.' + el.className.trim().split(/\\s+/).slice(0, 2).join('.')
+            : '';
+          return tag + id + cls;
+        };
+        const overflow = [];
+        if (includeOverflow && document.body) {
+          for (const el of document.body.querySelectorAll('*')) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.right > window.innerWidth + 1) {
+              overflow.push({
+                selector: describe(el),
+                tag: el.tagName.toLowerCase(),
+                left: Math.round(rect.left),
+                right: Math.round(rect.right),
+                width: Math.round(rect.width),
+                overshoot: Math.round(rect.right - window.innerWidth)
+              });
+            }
+          }
+          overflow.sort((left, right) => right.overshoot - left.overshoot);
+        }
+        const images = [...document.images];
+        const failedSrc = [];
+        let loaded = 0;
+        let failed = 0;
+        for (const img of images) {
+          if (img.complete && img.naturalWidth > 0) loaded += 1;
+          else if (img.complete && img.naturalWidth === 0) {
+            failed += 1;
+            failedSrc.push(String(img.currentSrc || img.src || '').slice(0, 500));
+          }
+        }
+        const fonts = document.fonts
+          ? { status: String(document.fonts.status || 'unknown'), size: Number(document.fonts.size || 0) }
+          : { status: 'unsupported', size: 0 };
+        const measured = [];
+        for (const selector of wanted) {
+          try {
+            const el = document.querySelector(selector);
+            if (!el) {
+              measured.push({ selector, found: false });
+              continue;
+            }
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            const tag = el.tagName.toLowerCase();
+            measured.push({
+              selector,
+              found: true,
+              tag,
+              rect: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) },
+              natural: tag === 'img' ? { width: Number(el.naturalWidth || 0), height: Number(el.naturalHeight || 0) } : undefined,
+              display: style ? style.display : undefined,
+              visibility: style ? style.visibility : undefined
+            });
+          } catch (error) {
+            measured.push({ selector, found: false, error: String(error && error.message ? error.message : error) });
+          }
+        }
+        return {
+          title: document.title,
+          url: location.href,
+          viewport: {
+            width: Math.round(window.innerWidth || 0),
+            height: Math.round(window.innerHeight || 0),
+            devicePixelRatio: window.devicePixelRatio || 1,
+            scrollY: Math.round(window.scrollY || doc.scrollTop || 0)
+          },
+          document: {
+            scrollWidth: Math.round(doc.scrollWidth || 0),
+            scrollHeight: Math.round(doc.scrollHeight || 0),
+            contentWidth: Math.round(document.body ? Math.max(document.body.scrollWidth || 0, document.body.offsetWidth || 0) : 0)
+          },
+          overflow: overflow.slice(0, 20),
+          overflowCount: overflow.length,
+          images: { total: images.length, loaded, failed, failedSrc: failedSrc.slice(0, 10) },
+          fonts,
+          selectors: measured
+        };
+      })()`;
+    }
+
+    /**
+     * In-page polling wait: selector / text / images / fonts / networkIdle.
+     * networkIdle is an approximation (resource-entry count + DOM mutations
+     * quiet for idleMs) because a renderer webview has no network events.
+     */
+    function waitConditionsJs(conditions = {}, timeoutMs = 8000) {
+      return `(async () => {
+        // __dshAgentWait
+        const conditions = ${JSON.stringify(conditions)};
+        const timeoutMs = ${Number(timeoutMs)};
+        const started = performance.now();
+        const idleMs = Math.max(0, Number(conditions.idleMs ?? 500));
+        let lastActivity = Date.now();
+        let resourceCount = 0;
+        try {
+          resourceCount = performance.getEntriesByType ? performance.getEntriesByType('resource').length : 0;
+        } catch (error) {
+          resourceCount = 0;
+        }
+        let observer;
+        try {
+          if (typeof MutationObserver === 'function' && document.documentElement) {
+            observer = new MutationObserver(() => { lastActivity = Date.now(); });
+            observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+          }
+        } catch (error) {
+          observer = undefined;
+        }
+        const inspect = () => {
+          const result = {};
+          if (conditions.selector) {
+            try { result.selector = document.querySelector(conditions.selector) !== null; }
+            catch (error) { result.selector = false; result.selectorError = String(error && error.message ? error.message : error); }
+          }
+          if (conditions.text) {
+            const bodyText = document.body ? String(document.body.innerText || '') : '';
+            result.text = bodyText.includes(conditions.text);
+          }
+          if (conditions.images) {
+            result.images = [...document.images].every((img) => img.complete === true);
+          }
+          if (conditions.fonts) {
+            result.fonts = !!(document.fonts && document.fonts.status === 'loaded');
+          }
+          if (conditions.networkIdle) {
+            let count = resourceCount;
+            try { count = performance.getEntriesByType ? performance.getEntriesByType('resource').length : resourceCount; } catch (error) { count = resourceCount; }
+            if (count !== resourceCount) {
+              resourceCount = count;
+              lastActivity = Date.now();
+            }
+            result.networkIdle = Date.now() - lastActivity >= idleMs;
+          }
+          return result;
+        };
+        const met = (state) => {
+          for (const [key, value] of Object.entries(state)) {
+            if (key === 'selectorError') continue;
+            if (value !== true) return false;
+          }
+          return true;
+        };
+        let state = inspect();
+        while (!met(state) && performance.now() - started < timeoutMs) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          state = inspect();
+        }
+        if (observer) observer.disconnect();
+        return { met: met(state), waitedMs: Math.round(performance.now() - started), conditions: state };
+      })()`;
+    }
+
+    /** Scroll an element (ref or selector) into view, then report real positions. */
+    function scrollIntoViewJs(target = {}) {
+      return `(async () => {
+        // __dshAgentScrollIntoView
+        const wanted = ${JSON.stringify(target)};
+        let el;
+        if (wanted.ref) {
+          const refs = window.__dshAgentRefs;
+          el = refs ? refs.get(wanted.ref) : undefined;
+          if (!el) return { ok: false, error: 'element ref ' + wanted.ref + ' is not in the current snapshot; take a new snapshot' };
+        } else {
+          try { el = document.querySelector(wanted.selector); }
+          catch (error) { return { ok: false, error: 'invalid selector: ' + String(error && error.message ? error.message : error) }; }
+          if (!el) return { ok: false, error: 'selector not found: ' + String(wanted.selector) };
+        }
+        if (!el.isConnected) return { ok: false, error: 'the target left the document; take a new snapshot' };
+        el.scrollIntoView({ block: wanted.block || 'center', inline: 'nearest', behavior: 'instant' });
+        const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        let lastScrollY = -1;
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          await nextFrame();
+          const now = Math.round(window.scrollY || 0);
+          if (now === lastScrollY) break;
+          lastScrollY = now;
+        }
+        const doc = document.scrollingElement || document.documentElement;
+        const rect = el.getBoundingClientRect();
+        const innerWidth = Math.round(window.innerWidth || 0);
+        const innerHeight = Math.round(window.innerHeight || 0);
+        return {
+          ok: true,
+          tag: el.tagName.toLowerCase(),
+          label: String(el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 80),
+          scrollY: Math.round(window.scrollY || doc.scrollTop || 0),
+          scrollHeight: Math.round(doc.scrollHeight || 0),
+          innerHeight,
+          inViewport: rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth,
+          rect: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) },
+          target: { ref: wanted.ref || undefined, selector: wanted.selector || undefined }
+        };
+      })()`;
+    }
+
+    /** Page-side probe for action=logs: failed images + suspicious resources. */
+    function logsProbeJs() {
+      return `(() => {
+        // __dshAgentLogsProbe
+        const failedImages = [];
+        let imageCount = 0;
+        for (const img of document.images) {
+          imageCount += 1;
+          if (img.complete && img.naturalWidth === 0) {
+            failedImages.push({ src: String(img.currentSrc || img.src || '').slice(0, 500), alt: String(img.alt || '').slice(0, 120) });
+          }
+        }
+        let entries = [];
+        try { entries = performance.getEntriesByType ? performance.getEntriesByType('resource') : []; } catch (error) { entries = []; }
+        // A zero transferSize with non-zero duration usually means a failed or
+        // cross-origin-restricted resource; HTTP status codes are not exposed.
+        const suspicious = entries.filter((entry) => entry && entry.transferSize === 0 && entry.duration > 0);
+        const resources = suspicious.slice(-20).map((entry) => ({
+          name: String(entry.name || '').slice(0, 500),
+          initiatorType: entry.initiatorType || '?',
+          duration: Math.round(entry.duration || 0),
+          transferSize: entry.transferSize,
+          decodedBodySize: entry.decodedBodySize
+        }));
+        return { imageCount, failedImages: failedImages.slice(0, 20), resourceCount: entries.length, resources };
+      })()`;
+    }
+
+    /** Hide/show the injected virtual cursor so screenshots have no overlay. */
+    function cursorVisibilityJs(hide) {
+      return `(() => {
+        // __dshAgentCursorVisibility
+        const host = document.getElementById(${JSON.stringify(CURSOR_HOST_ID)});
+        if (!host) return { found: false, hidden: ${hide === true} };
+        const previous = host.style.display;
+        host.style.display = ${hide === true} ? 'none' : (previous === 'none' ? '' : previous);
+        return { found: true, hidden: ${hide === true}, previous };
+      })()`;
+    }
+
+    /** Measure an element for a capturePage(rect) element screenshot. */
+    function screenshotTargetJs(target = {}) {
+      return `(async () => {
+        // __dshAgentScreenshotTarget
+        const wanted = ${JSON.stringify(target)};
+        let el;
+        if (wanted.ref) {
+          const refs = window.__dshAgentRefs;
+          el = refs ? refs.get(wanted.ref) : undefined;
+          if (!el) return { ok: false, error: 'element ref ' + wanted.ref + ' is not in the current snapshot; take a new snapshot' };
+        } else {
+          try { el = document.querySelector(wanted.selector); }
+          catch (error) { return { ok: false, error: 'invalid selector: ' + String(error && error.message ? error.message : error) }; }
+          if (!el) return { ok: false, error: 'selector not found: ' + String(wanted.selector) };
+        }
+        if (!el.isConnected) return { ok: false, error: 'the target left the document; take a new snapshot' };
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        let lastScrollY = -1;
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          await nextFrame();
+          const now = Math.round(window.scrollY || 0);
+          if (now === lastScrollY) break;
+          lastScrollY = now;
+        }
+        const rect = el.getBoundingClientRect();
+        const viewport = {
+          width: Math.round(window.innerWidth || 0),
+          height: Math.round(window.innerHeight || 0),
+          devicePixelRatio: window.devicePixelRatio || 1
+        };
+        const clamp = (value, max) => Math.max(0, Math.min(Math.round(value), Math.max(0, max)));
+        const x = clamp(rect.left, viewport.width);
+        const y = clamp(rect.top, viewport.height);
+        const width = clamp(rect.right, viewport.width) - x;
+        const height = clamp(rect.bottom, viewport.height) - y;
+        if (width <= 0 || height <= 0) {
+          return {
+            ok: false,
+            error: 'the target is outside the visible viewport; scroll it into view first',
+            viewport,
+            rect: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) }
+          };
+        }
+        return {
+          ok: true,
+          viewport,
+          rect: { x, y, width, height },
+          clipped: width < Math.round(rect.width) || height < Math.round(rect.height),
+          target: {
+            tag: el.tagName.toLowerCase(),
+            label: String(el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 80)
+          }
+        };
+      })()`;
+    }
+
+    /**
+     * Rewrite one media query so a width condition stands in for
+     * `(prefers-color-scheme: …)`:
+     * - true  → `(min-width: 0px)`      (always matches, even at width 0)
+     * - false → `(min-width: 100000px)` (never matches)
+     * Other conditions (media types, and/not/only, commas) are left intact, so
+     * combinations evaluate with the real matchMedia engine.
+     *
+     * Pure function: also used inside the generated page script below, so its
+     * behaviour is unit-testable without a browser.
+     */
+    function rewriteColorSchemeQuery(query, scheme) {
+      const text = String(query ?? "");
+      if (scheme !== "light" && scheme !== "dark") return { query: text, changed: false };
+      let changed = false;
+      const rewritten = text.replace(/\(\s*prefers-color-scheme\s*:\s*(light|dark)\s*\)/giu, (_match, wanted) => {
+        changed = true;
+        const target = String(wanted).toLowerCase() === "dark" ? "dark" : "light";
+        return target === scheme ? "(min-width: 0px)" : "(min-width: 100000px)";
+      });
+      return { query: changed ? rewritten : text, changed };
+    }
+
+    /**
+     * Best-effort prefers-color-scheme emulation for the guest page:
+     * 1. wrap window.matchMedia for color-scheme queries (width-condition stand-in);
+     * 2. rewrite same-origin @media rules containing prefers-color-scheme to
+     *    `all` / `not all` (reversible; nested group rules included);
+     * 3. re-scan late-loading stylesheets via MutationObserver + a short poll;
+     * 4. `auto` restores native matchMedia and the original media texts.
+     * Cross-origin stylesheets are unreadable and reported as such.
+     */
+    function emulateJs(scheme) {
+      const rewriteSource = rewriteColorSchemeQuery.toString();
+      return `(() => {
+        // __dshAgentEmulate
+        const SCHEME = ${JSON.stringify(scheme)};
+        const rewrite = ${rewriteSource};
+        const COLOR_SCHEME = /prefers-color-scheme/i;
+        const state = (window.__dshAgentEmulation = window.__dshAgentEmulation || {});
+        if (!Array.isArray(state.patched)) state.patched = [];
+        if (!Array.isArray(state.lists)) state.lists = [];
+        if (state.installed !== true) {
+          state.installed = true;
+          state.nativeMatchMedia = typeof window.matchMedia === 'function' ? window.matchMedia.bind(window) : null;
+          if (state.nativeMatchMedia) {
+            window.matchMedia = function (query) {
+              const text = String(query);
+              if (!COLOR_SCHEME.test(text)) return state.nativeMatchMedia(text);
+              const wrapper = {
+                media: text,
+                matches: false,
+                onchange: null,
+                __listeners: [],
+                addEventListener(type, listener) {
+                  if (type === 'change' && typeof listener === 'function') this.__listeners.push(listener);
+                },
+                removeEventListener(type, listener) {
+                  const index = this.__listeners.indexOf(listener);
+                  if (index >= 0) this.__listeners.splice(index, 1);
+                },
+                addListener(listener) { this.addEventListener('change', listener); },
+                removeListener(listener) { this.removeEventListener('change', listener); },
+                __recompute() {
+                  const forced = window.__dshAgentEmulation && window.__dshAgentEmulation.scheme;
+                  const next = forced === 'light' || forced === 'dark'
+                    ? !!state.nativeMatchMedia(rewrite(text, forced).query).matches
+                    : !!state.nativeMatchMedia(text).matches;
+                  if (next !== this.matches) {
+                    this.matches = next;
+                    const event = { matches: next, media: text, target: this };
+                    for (const listener of [...this.__listeners]) {
+                      try { listener(event); } catch (error) {}
+                    }
+                  }
+                  return next;
+                }
+              };
+              wrapper.__recompute();
+              state.lists.push(wrapper);
+              return wrapper;
+            };
+          }
+        }
+        const restoredCount = state.patched.length;
+        for (const entry of state.patched) {
+          try { entry.rule.media.mediaText = entry.original; } catch (error) {}
+        }
+        state.patched = [];
+        const sheets = { scanned: 0, patched: 0, crossOrigin: 0, unreadable: 0 };
+        const match = (query) => {
+          try { return !!(state.nativeMatchMedia && state.nativeMatchMedia(query).matches); } catch (error) { return false; }
+        };
+        const normalizeRule = (rule) => {
+          try {
+            if (!rule || typeof rule !== 'object') return;
+            const media = rule.media;
+            if (media && typeof media.mediaText === 'string' && COLOR_SCHEME.test(media.mediaText)) {
+              const original = media.mediaText;
+              const shouldApply = match(rewrite(original, SCHEME).query);
+              media.mediaText = shouldApply ? 'all' : 'not all';
+              state.patched.push({ rule, original });
+              sheets.patched += 1;
+            }
+            const nested = rule.cssRules;
+            if (nested && nested.length) {
+              for (const child of nested) normalizeRule(child);
+            }
+          } catch (error) {
+            sheets.unreadable += 1;
+          }
+        };
+        const scan = () => {
+          let list;
+          try { list = document.styleSheets; } catch (error) { return; }
+          for (const sheet of Array.from(list || [])) {
+            sheets.scanned += 1;
+            let rules;
+            try { rules = sheet.cssRules; }
+            catch (error) { sheets.crossOrigin += 1; continue; }
+            if (!rules) continue;
+            for (const rule of Array.from(rules)) normalizeRule(rule);
+          }
+        };
+        if (SCHEME === 'light' || SCHEME === 'dark') {
+          state.scheme = SCHEME;
+          if (document.documentElement && document.documentElement.style) document.documentElement.style.colorScheme = SCHEME;
+          scan();
+          if (typeof MutationObserver === 'function' && document.documentElement) {
+            if (!state.observer) {
+              state.observer = new MutationObserver(() => {
+                if (state.scanTimer) return;
+                state.scanTimer = setTimeout(() => { state.scanTimer = undefined; scan(); }, 120);
+              });
+              state.observer.observe(document.documentElement, { subtree: true, childList: true });
+            }
+          }
+          if (!state.poll) {
+            let remaining = 20;
+            state.poll = setInterval(() => {
+              scan();
+              remaining -= 1;
+              if (remaining <= 0) { clearInterval(state.poll); state.poll = undefined; }
+            }, 500);
+          }
+        } else {
+          state.scheme = 'auto';
+          if (state.nativeMatchMedia) window.matchMedia = state.nativeMatchMedia;
+          if (state.observer) { state.observer.disconnect(); state.observer = undefined; }
+          if (state.poll) { clearInterval(state.poll); state.poll = undefined; }
+          if (document.documentElement && document.documentElement.style) document.documentElement.style.colorScheme = '';
+        }
+        for (const wrapper of state.lists) {
+          try { wrapper.__recompute(); } catch (error) {}
+        }
+        const verify = (query) => {
+          try { return window.matchMedia ? !!window.matchMedia(query).matches : undefined; } catch (error) { return undefined; }
+        };
+        return {
+          scheme: SCHEME,
+          matchMediaOverridden: !!(state.nativeMatchMedia && state.installed && (SCHEME === 'light' || SCHEME === 'dark')),
+          colorScheme: document.documentElement && document.documentElement.style ? String(document.documentElement.style.colorScheme || '') : null,
+          sheets,
+          mediaRules: { patched: sheets.patched, restored: restoredCount },
+          verified: {
+            darkMatches: verify('(prefers-color-scheme: dark)'),
+            lightMatches: verify('(prefers-color-scheme: light)')
+          }
+        };
+      })()`;
+    }
+
+    /** Render self-contained HTML over the current document context. */
+    function setContentJs(html) {
+      return `(async () => {
+        // __dshAgentSetContent
+        const HTML = ${JSON.stringify(String(html ?? ""))};
+        document.open();
+        document.write(HTML);
+        document.close();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        if (document.fonts && document.fonts.ready) {
+          try { await Promise.race([document.fonts.ready, new Promise((resolve) => setTimeout(resolve, 500))]); } catch (error) {}
+        }
+        const doc = document.scrollingElement || document.documentElement;
+        return {
+          title: document.title,
+          url: location.href,
+          readyState: document.readyState,
+          viewport: {
+            width: Math.round(window.innerWidth || 0),
+            height: Math.round(window.innerHeight || 0),
+            devicePixelRatio: window.devicePixelRatio || 1
+          },
+          scrollHeight: Math.round(doc.scrollHeight || 0)
+        };
+      })()`;
+    }
+
+    // ---------------------------------------------------------------------
+    // Plain helpers shared by the controller and the unit tests.
+    // ---------------------------------------------------------------------
+
+    /** Base64-encode bytes without Buffer (the renderer may not expose it). */
+    function bytesToBase64(bytes) {
+      const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      let output = "";
+      for (let index = 0; index < bytes.length; index += 3) {
+        const first = bytes[index];
+        const second = index + 1 < bytes.length ? bytes[index + 1] : undefined;
+        const third = index + 2 < bytes.length ? bytes[index + 2] : undefined;
+        output += alphabet[first >> 2];
+        output += alphabet[((first & 3) << 4) | ((second ?? 0) >> 4)];
+        output += second === undefined ? "=" : alphabet[((second & 15) << 2) | ((third ?? 0) >> 6)];
+        output += third === undefined ? "=" : alphabet[third & 63];
+      }
+      return output;
+    }
+
+    /**
+     * Convert a captured image to a data URL. Electron's NativeImage exposes
+     * toPNG()/toJPEG(quality); toDataURL() is the fallback some mocks provide.
+     */
+    function imageToDataUrl(image, format, quality) {
+      if (image === undefined || image === null) throw new Error("capturePage did not return an image");
+      const requested = format === "jpeg" ? "jpeg" : "png";
+      if (requested === "jpeg" && typeof image.toJPEG === "function") {
+        const bytes = image.toJPEG(Math.max(1, Math.min(100, Number(quality ?? 80))));
+        if (bytes && bytes.length > 0) return `data:image/jpeg;base64,${bytesToBase64(bytes)}`;
+      }
+      if (typeof image.toPNG === "function") {
+        const bytes = image.toPNG();
+        if (bytes && bytes.length > 0) return `data:image/png;base64,${bytesToBase64(bytes)}`;
+      }
+      if (typeof image.toDataURL === "function") {
+        const dataUrl = image.toDataURL();
+        if (typeof dataUrl === "string" && dataUrl.startsWith("data:image/")) return dataUrl;
+      }
+      throw new Error("capturePage did not return an image");
+    }
+
+    /** Clamp a requested clip rectangle to the real viewport (visible intersection). */
+    function clampRect(rect, viewport) {
+      if (rect === undefined || rect === null) return undefined;
+      const boundsWidth = Math.max(1, Math.round(Number(viewport?.width ?? viewport?.innerWidth ?? 0)));
+      const boundsHeight = Math.max(1, Math.round(Number(viewport?.height ?? viewport?.innerHeight ?? 0)));
+      const rawX = Number(rect.x ?? 0);
+      const rawY = Number(rect.y ?? 0);
+      const rawWidth = Number(rect.width ?? 0);
+      const rawHeight = Number(rect.height ?? 0);
+      if (![rawX, rawY, rawWidth, rawHeight].every((value) => Number.isFinite(value))) return undefined;
+      const left = Math.max(0, Math.round(rawX));
+      const top = Math.max(0, Math.round(rawY));
+      const right = Math.min(boundsWidth, Math.round(rawX + rawWidth));
+      const bottom = Math.min(boundsHeight, Math.round(rawY + rawHeight));
+      if (right - left < 1 || bottom - top < 1) return undefined;
+      return { x: left, y: top, width: right - left, height: bottom - top };
+    }
+
+    /** Inject a validated http(s) base URL as <base> unless the HTML has one. */
+    function injectBaseHref(html, baseUrl) {
+      const text = String(html ?? "");
+      if (typeof baseUrl !== "string" || baseUrl === "") return { html: text, injected: false };
+      if (/<base[\s>]/iu.test(text)) {
+        return { html: text, injected: false, warning: "html already contains a <base> tag; it was left untouched" };
+      }
+      const escaped = baseUrl.replace(/&/gu, "&amp;").replace(/"/gu, "&quot;");
+      const tag = `<base href="${escaped}">`;
+      const head = /<head[^>]*>/iu.exec(text);
+      if (head !== null) {
+        const index = head.index + head[0].length;
+        return { html: text.slice(0, index) + tag + text.slice(index), injected: true };
+      }
+      return { html: tag + text, injected: true };
+    }
+
+    /** about:blank (with or without the lease fragment) needs no navigation. */
+    function isBlankUrl(url) {
+      return typeof url === "string" && url.startsWith("about:blank");
+    }
+
+    /** UTF-8 byte length where TextEncoder exists, else UTF-16 units (clamped). */
+    function utf8Length(text) {
+      const value = String(text ?? "");
+      if (typeof TextEncoder === "function") {
+        try {
+          return new TextEncoder().encode(value).length;
+        } catch {
+          return value.length;
+        }
+      }
+      return value.length;
+    }
+
+    // ---------------------------------------------------------------------
     // Panel controller: owns the leased webview and executes commands.
     // Exported through plugin.__test so unit tests drive it with mocks.
     // ---------------------------------------------------------------------
@@ -349,6 +970,9 @@ window.__ModuleLoader__.load({
       const diag = options.diag ?? (() => Promise.resolve());
       const ensurePanel = options.ensurePanel ?? (() => {});
       const navigationWaitMs = options.navigationWaitMs ?? 1200;
+      const consoleLimit = options.consoleLimit ?? 200;
+      const evaluateResultLimit = options.evaluateResultLimit ?? 200 * 1024;
+      const fullPageMaxCssPx = options.fullPageMaxCssPx ?? 12000;
 
       let webview;
       let lease;
@@ -356,6 +980,18 @@ window.__ModuleLoader__.load({
       let mountPromise;
       let lastSnapshot;
       let navigationCount = 0;
+      let mountContainer;
+      /** Last container a webview was mounted into; lets action=open reopen after close. */
+      let lastMountContainer;
+      /** Requested fixed CSS viewport {width,height,scale}; undefined = auto. */
+      let viewportState;
+      /** Current best-effort prefers-color-scheme emulation: light/dark/auto. */
+      let themeState = "auto";
+      let lastNavigation = { url: "", title: "" };
+      /** Ring buffer of webview console-message events (≤ consoleLimit). */
+      const consoleLog = [];
+      const consoleCounts = { error: 0, warning: 0 };
+      let consoleTotal = 0;
       const readyWaiters = [];
       const navigationWaiters = [];
 
@@ -418,14 +1054,31 @@ window.__ModuleLoader__.load({
           const reservation = await desktopBridge.acquire(WORKSPACE_KEY);
           void postDiag("panel", { phase: "mount-acquired", lease: reservation.lease });
           lease = reservation.lease;
+          mountContainer = container;
+          lastMountContainer = container;
+          try {
+            // A fixed viewport is displayed scaled-down inside the panel; the
+            // panel clips the over-sized guest instead of scrolling the page.
+            container.style.overflow = "hidden";
+            container.style.position = "relative";
+          } catch {
+            // Mock containers in tests use plain objects.
+          }
           const element = documentRef.createElement("webview");
           webview = element;
           element.setAttribute("name", reservation.lease);
           element.setAttribute("partition", reservation.partition);
           element.setAttribute("src", `about:blank#${reservation.lease}`);
           element.style.cssText = "width:100%;height:100%;display:flex;background:#0b0d12";
+          if (viewportState !== undefined) applyViewportStyle(viewportState);
           element.addEventListener("did-navigate", () => {
+            // A new document means the previous snapshot refs are gone.
+            lastSnapshot = undefined;
             settleNavigation();
+            lastNavigation = { url: safePageUrl(element), title: "" };
+          });
+          element.addEventListener("console-message", (event) => {
+            recordConsoleMessage(event);
           });
           // Lifecycle diagnostics: a panel can stop polling without an error
           // (guest crash, lease teardown, host unmount). Record why it happened.
@@ -458,6 +1111,14 @@ window.__ModuleLoader__.load({
             );
             container.appendChild(element);
           });
+          if (themeState !== "auto") {
+            // A fresh about:blank context must carry the current emulation.
+            try {
+              await element.executeJavaScript(emulateJs(themeState));
+            } catch {
+              // Best effort: the panel may still be blank.
+            }
+          }
           void postDiag("panel", { phase: "ready", lease: reservation.lease });
         })().catch((error) => {
           mountPromise = undefined;
@@ -481,6 +1142,14 @@ window.__ModuleLoader__.load({
         ready = false;
         mountPromise = undefined;
         lastSnapshot = undefined;
+        mountContainer = undefined;
+        viewportState = undefined;
+        themeState = "auto";
+        lastNavigation = { url: "", title: "" };
+        consoleLog.length = 0;
+        consoleCounts.error = 0;
+        consoleCounts.warning = 0;
+        consoleTotal = 0;
         try {
           element?.remove?.();
         } catch {
@@ -493,6 +1162,33 @@ window.__ModuleLoader__.load({
           clearTimeout(waiter.timer);
           waiter.reject(new Error("Agent Browser panel was closed"));
         }
+      }
+
+      /** Normalize Electron console-message levels (number or string events). */
+      function normalizeConsoleLevel(level) {
+        if (typeof level === "number") return ["verbose", "info", "warning", "error"][level] ?? "info";
+        const text = String(level ?? "info").toLowerCase();
+        if (text === "warning" || text === "warn") return "warning";
+        if (text === "error") return "error";
+        if (text === "info" || text === "verbose" || text === "log" || text === "debug") return "info";
+        return text;
+      }
+
+      /** Append one console-message event to the ring buffer (≤ consoleLimit). */
+      function recordConsoleMessage(event) {
+        const level = normalizeConsoleLevel(event?.level);
+        const entry = {
+          level,
+          message: String(event?.message ?? "").slice(0, 2000),
+          line: Number(event?.line ?? 0) || 0,
+          source: String(event?.sourceId ?? event?.source ?? "").slice(0, 500),
+          at: Date.now(),
+        };
+        consoleTotal += 1;
+        if (level === "error") consoleCounts.error += 1;
+        else if (level === "warning") consoleCounts.warning += 1;
+        consoleLog.push(entry);
+        if (consoleLog.length > consoleLimit) consoleLog.splice(0, consoleLog.length - consoleLimit);
       }
 
       /** Current URL without evaluating page script (used for navigation checks). */
@@ -562,6 +1258,120 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** Panel size in CSS px (undefined when the host cannot measure it). */
+      function panelSize() {
+        const container = mountContainer;
+        if (container === undefined || container === null) return undefined;
+        let width = Number(container.clientWidth);
+        let height = Number(container.clientHeight);
+        if ((!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) && typeof container.getBoundingClientRect === "function") {
+          try {
+            const rect = container.getBoundingClientRect();
+            width = Number(rect?.width);
+            height = Number(rect?.height);
+          } catch {
+            return undefined;
+          }
+        }
+        if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined;
+        return { width: Math.round(width), height: Math.round(height) };
+      }
+
+      /** Scale that fits the requested guest viewport into the visible panel. */
+      function computeScale(width, height) {
+        const panel = panelSize();
+        if (panel === undefined) return 1;
+        const scale = Math.min(panel.width / width, panel.height / height, 1);
+        return Math.round(scale * 1000) / 1000;
+      }
+
+      /** Apply the requested fixed viewport to the webview element. */
+      function applyViewportStyle(state) {
+        const element = webview;
+        if (element === undefined) return;
+        try {
+          if (state === undefined) {
+            element.style.width = "100%";
+            element.style.height = "100%";
+            element.style.flex = "";
+            element.style.transform = "";
+            element.style.transformOrigin = "";
+            return;
+          }
+          element.style.width = `${state.width}px`;
+          element.style.height = `${state.height}px`;
+          element.style.flex = "0 0 auto";
+          element.style.transformOrigin = "0 0";
+          element.style.transform = state.scale === 1 ? "" : `scale(${state.scale})`;
+        } catch {
+          // A detached guest may reject style writes; the receipt reports actual.
+        }
+      }
+
+      /** Read the guest's real viewport numbers after a resize. */
+      async function readViewportInfo(current) {
+        let info;
+        try {
+          info = await current.executeJavaScript(viewportInfoJs());
+        } catch {
+          info = undefined;
+        }
+        return {
+          innerWidth: Math.round(Number(info?.innerWidth ?? 0)),
+          innerHeight: Math.round(Number(info?.innerHeight ?? 0)),
+          devicePixelRatio: Number(info?.devicePixelRatio ?? 1),
+          scrollWidth: Math.round(Number(info?.scrollWidth ?? 0)),
+          scrollHeight: Math.round(Number(info?.scrollHeight ?? 0)),
+        };
+      }
+
+      /** Replay the best-effort theme shim after a page context was replaced. */
+      async function replayTheme(current) {
+        if (themeState === "auto") return false;
+        try {
+          await current.executeJavaScript(emulateJs(themeState));
+          return true;
+        } catch {
+          // The new page may not be ready yet; the emulate action still works.
+          return false;
+        }
+      }
+
+      /** Navigation invalidates the in-page cursor/refs; replay emulation if set. */
+      async function afterNavigation(current, info, fallbackUrl) {
+        lastSnapshot = undefined;
+        lastNavigation = { url: info.url || fallbackUrl || "", title: info.title || "" };
+        await replayTheme(current);
+      }
+
+      /**
+       * Ensure the panel exists and its webview is ready, reopening a released
+       * guest when needed. Shared by open/navigate so a navigate can be the
+       * first call (qa, agent shortcuts) instead of failing on a closed panel.
+       */
+      async function ensurePanelReady() {
+        if (ready) return;
+        if (webview === undefined) ensurePanel();
+        if (webview === undefined && lastMountContainer !== undefined) {
+          // action=close released the guest but the React body keeps its
+          // container; mount a fresh leased webview into it on reopen.
+          try {
+            await ensureMounted(lastMountContainer);
+          } catch (error) {
+            void postDiag("panel", { phase: "reopen-mount-failed", error: String(error && error.message ? error.message : error) });
+          }
+        }
+        try {
+          await waitReady(2500);
+        } catch {
+          // The DSH right sidebar can keep a stale tab entry that never mounts
+          // its body after plugin reloads; fall back to a floating panel so the
+          // tool stays usable.
+          await ensureFallbackMounted();
+          await waitReady();
+        }
+      }
+
       async function handle(command) {
         const type = String(command?.type ?? "");
         switch (type) {
@@ -569,31 +1379,23 @@ window.__ModuleLoader__.load({
             return { ok: true, ...status() };
           case "open": {
             const url = toHttpUrl(command.url);
-            if (!ready) {
-              if (webview === undefined) ensurePanel();
-              try {
-                await waitReady(2500);
-              } catch {
-                // The DSH right sidebar can keep a stale tab entry that never
-                // mounts its body after plugin reloads; fall back to a floating
-                // panel so the tool stays usable.
-                await ensureFallbackMounted();
-                await waitReady();
-              }
-            }
+            await ensurePanelReady();
             const current = await requireReady();
             await current.loadURL(url);
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
-            return { ok: true, url: info.url || url, title: info.title };
+            await afterNavigation(current, info, url);
+            return { ok: true, url: info.url || url, title: info.title, themeReapplied: themeState !== "auto" };
           }
           case "navigate": {
             const url = toHttpUrl(command.url);
+            await ensurePanelReady();
             const current = await requireReady();
             await current.loadURL(url);
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
-            return { ok: true, url: info.url || url, title: info.title };
+            await afterNavigation(current, info, url);
+            return { ok: true, url: info.url || url, title: info.title, themeReapplied: themeState !== "auto" };
           }
           case "snapshot": {
             const current = await requireReady();
@@ -636,6 +1438,12 @@ window.__ModuleLoader__.load({
             const scroll = await current.executeJavaScript(scrollStateJs()).catch(() => undefined);
             const urlChanged = beforeUrl !== "" && info.url !== "" && beforeUrl !== info.url;
             const navigated = eventNavigated || urlChanged;
+            if (navigated) {
+              // A click can replace the document (link/form); the theme shim
+              // lives on window and must be replayed on the new context.
+              lastNavigation = { url: info.url, title: info.title };
+              await replayTheme(current);
+            }
             return {
               ok: true,
               x,
@@ -721,6 +1529,11 @@ window.__ModuleLoader__.load({
             }
             const settle = await settlePage(current);
             const info = await pageInfo();
+            const navigatedAfterKey = beforeUrl !== "" && info.url !== "" && beforeUrl !== info.url;
+            if (navigatedAfterKey) {
+              lastNavigation = { url: info.url, title: info.title };
+              await replayTheme(current);
+            }
             return {
               ok: true,
               key,
@@ -728,13 +1541,13 @@ window.__ModuleLoader__.load({
               title: info.title,
               submit,
               settle,
-              changed: Number(settle?.mutations ?? 0) > 0 || submit?.submitted === true,
+              changed: Number(settle?.mutations ?? 0) > 0 || submit?.submitted === true || navigatedAfterKey,
             };
           }
           case "scroll": {
             const current = await requireReady();
-            const deltaY = Number(command.deltaY ?? 400);
-            if (!Number.isFinite(deltaY)) throw new Error("scroll requires a numeric deltaY");
+            const requestedDelta = Number(command.deltaY ?? 400);
+            if (!Number.isFinite(requestedDelta)) throw new Error("scroll requires a numeric deltaY");
             let x = 300;
             let y = 300;
             const viewport = lastSnapshot?.viewport;
@@ -749,64 +1562,341 @@ window.__ModuleLoader__.load({
                 y = target.y;
               }
             }
-            current.sendInputEvent({ type: "mouseWheel", x, y, deltaX: 0, deltaY, canScroll: true });
-            await sleepImpl(140);
             const before = await current.executeJavaScript(scrollStateJs());
             const beforeScrollY = typeof before?.scrollY === "number" ? before.scrollY : undefined;
-            let state = before;
+            current.sendInputEvent({ type: "mouseWheel", x, y, deltaX: 0, deltaY: requestedDelta, canScroll: true });
+            await sleepImpl(140);
+            let state = await current.executeJavaScript(scrollStateJs());
             let method = "wheel";
-            if (
-              deltaY !== 0 &&
-              typeof beforeScrollY === "number" &&
-              typeof state?.scrollY === "number" &&
-              state.scrollY === beforeScrollY
-            ) {
+            if (requestedDelta !== 0 && typeof beforeScrollY === "number" && Number(state?.scrollY) === beforeScrollY) {
               // Synthetic wheel input is not always honored by the guest; fall
               // back to scripted scrolling so the page actually moves.
-              await current.executeJavaScript(scrollFallbackJs(deltaY));
+              await current.executeJavaScript(scrollFallbackJs(requestedDelta));
               await sleepImpl(120);
               state = await current.executeJavaScript(scrollStateJs());
               method = "script";
             }
             const settle = await settlePage(current);
             const finalScrollY = typeof state?.scrollY === "number" ? state.scrollY : undefined;
+            const actualDelta =
+              typeof beforeScrollY === "number" && typeof finalScrollY === "number" ? finalScrollY - beforeScrollY : undefined;
+            const clamped =
+              requestedDelta !== 0 && typeof actualDelta === "number" ? Math.abs(actualDelta) < Math.abs(requestedDelta) : false;
             return {
               ok: true,
-              deltaY,
+              requestedDelta,
+              deltaY: requestedDelta,
+              actualDelta,
               method,
               scrollY: finalScrollY,
               scrollHeight: typeof state?.scrollHeight === "number" ? state.scrollHeight : undefined,
               innerHeight: typeof state?.innerHeight === "number" ? state.innerHeight : undefined,
+              clamped,
               settle,
-              changed: Number(settle?.mutations ?? 0) > 0 || (typeof beforeScrollY === "number" && typeof finalScrollY === "number" && finalScrollY !== beforeScrollY),
+              changed: Number(settle?.mutations ?? 0) > 0 || (typeof actualDelta === "number" && actualDelta !== 0),
             };
+          }
+          case "scrollIntoView": {
+            const current = await requireReady();
+            const target = { block: command.block === undefined ? "center" : String(command.block) };
+            if (command.ref !== undefined && command.ref !== null) target.ref = String(command.ref);
+            if (typeof command.selector === "string" && command.selector !== "") target.selector = command.selector;
+            if (target.ref === undefined && target.selector === undefined) throw new Error("scrollIntoView requires a ref or selector");
+            const result = await current.executeJavaScript(scrollIntoViewJs(target));
+            if (result === undefined || result === null || result.ok !== true) {
+              throw new Error(result?.error ?? "scrollIntoView target not found; take a snapshot first");
+            }
+            const settle = await settlePage(current);
+            return { ok: true, ...result, settle, changed: true };
           }
           case "wait": {
             const current = await requireReady();
-            const selector = typeof command.selector === "string" && command.selector !== "" ? command.selector : undefined;
-            if (selector !== undefined) {
-              const timeoutMs = Number(command.ms ?? 8000);
-              const started = Date.now();
-              for (;;) {
-                const state = await current.executeJavaScript(waitSelectorJs(selector));
-                if (state && state.found === true) return { ok: true, waitedMs: Date.now() - started, selector };
-                if (Date.now() - started > timeoutMs) throw new Error(`selector not found within ${timeoutMs}ms: ${selector}`);
-                await sleepImpl(150);
+            const conditions = {};
+            if (typeof command.selector === "string" && command.selector !== "") conditions.selector = command.selector;
+            if (typeof command.text === "string" && command.text !== "") conditions.text = command.text;
+            if (command.networkIdle === true) conditions.networkIdle = true;
+            if (command.images === true) conditions.images = true;
+            if (command.fonts === true) conditions.fonts = true;
+            if (command.idleMs !== undefined) conditions.idleMs = Math.max(0, Number(command.idleMs));
+            const conditional = Object.keys(conditions).length > 0;
+            const timeoutMs = Math.max(0, Number(command.ms ?? (conditional ? 8000 : 500)));
+            if (!conditional) {
+              await sleepImpl(timeoutMs);
+              return { ok: true, waitedMs: timeoutMs, mode: "sleep" };
+            }
+            const result = await current.executeJavaScript(waitConditionsJs(conditions, timeoutMs));
+            if (result === undefined || result === null || result.met !== true) {
+              const state = result?.conditions === undefined ? "no page result" : JSON.stringify(result.conditions);
+              throw new Error(`wait timed out after ${result?.waitedMs ?? timeoutMs}ms (${state})`);
+            }
+            return { ok: true, waitedMs: result.waitedMs, conditions: result.conditions, mode: "conditions" };
+          }
+          case "metrics": {
+            const current = await requireReady();
+            const selectors = Array.isArray(command.selectors) ? command.selectors.map(String).slice(0, 20) : [];
+            const metrics = await current.executeJavaScript(metricsJs(selectors, command.includeOverflow !== false));
+            if (metrics === undefined || metrics === null || typeof metrics !== "object") {
+              throw new Error("the page returned no metrics");
+            }
+            return {
+              ok: true,
+              metrics: {
+                ...metrics,
+                console: {
+                  errors: consoleCounts.error,
+                  warnings: consoleCounts.warning,
+                  total: consoleTotal,
+                  entries: consoleLog.length,
+                },
+              },
+            };
+          }
+          case "evaluate": {
+            const current = await requireReady();
+            const expression = typeof command.expression === "string" ? command.expression : "";
+            if (expression.trim() === "") throw new Error("evaluate requires a non-empty expression");
+            let result = await current.executeJavaScript(expression);
+            if (result === undefined) result = null;
+            let serialized;
+            try {
+              serialized = JSON.stringify(result);
+            } catch {
+              serialized = String(result);
+            }
+            if (typeof serialized === "string" && serialized.length > evaluateResultLimit) {
+              // Protect the loopback result body (1MB cap) from a runaway
+              // expression; the Host applies the 16KB receipt budget on top.
+              return {
+                ok: true,
+                result: {
+                  __truncated__: true,
+                  bytes: serialized.length,
+                  note: `result is ${serialized.length} chars; return a smaller value`,
+                  preview: serialized.slice(0, 2000),
+                },
+              };
+            }
+            return { ok: true, result };
+          }
+          case "viewport": {
+            const current = await requireReady();
+            if (command.reset === true) {
+              viewportState = undefined;
+              applyViewportStyle(undefined);
+              await sleepImpl(120);
+              const actual = await readViewportInfo(current);
+              return { ok: true, reset: true, width: actual.innerWidth, height: actual.innerHeight, actual };
+            }
+            const width = Math.max(64, Math.min(10000, Math.round(Number(command.width))));
+            const height = Math.max(64, Math.min(10000, Math.round(Number(command.height ?? 800))));
+            if (!Number.isFinite(width) || !Number.isFinite(height)) throw new Error("viewport requires numeric width and height");
+            const scale = computeScale(width, height);
+            viewportState = { width, height, scale };
+            applyViewportStyle(viewportState);
+            await sleepImpl(150);
+            const actual = await readViewportInfo(current);
+            return { ok: true, width, height, scale, actual, panel: panelSize() };
+          }
+          case "logs": {
+            const current = await requireReady();
+            const limit = Math.max(1, Math.min(200, Math.round(Number(command.limit ?? 50))));
+            const filter = typeof command.filter === "string" && command.filter !== "" ? command.filter.toLowerCase() : undefined;
+            const bufferSize = consoleLog.length;
+            let clearedCount = 0;
+            if (command.clear === true) {
+              clearedCount = consoleLog.length;
+              consoleLog.length = 0;
+              consoleCounts.error = 0;
+              consoleCounts.warning = 0;
+              consoleTotal = 0;
+            }
+            let entries = consoleLog.map((entry) => ({ ...entry }));
+            if (filter !== undefined) entries = entries.filter((entry) => JSON.stringify(entry).toLowerCase().includes(filter));
+            const matched = entries.length;
+            entries = entries.slice(-limit);
+            let probe;
+            try {
+              probe = await current.executeJavaScript(logsProbeJs());
+            } catch {
+              probe = undefined;
+            }
+            return {
+              ok: true,
+              entries,
+              matched,
+              bufferSize,
+              bufferLimit: consoleLimit,
+              totalSeen: consoleTotal,
+              clearedCount,
+              filter: command.filter,
+              probe: probe !== null && typeof probe === "object" ? probe : {},
+            };
+          }
+          case "emulate": {
+            const current = await requireReady();
+            const scheme = String(command.colorScheme ?? "auto");
+            if (scheme !== "light" && scheme !== "dark" && scheme !== "auto") {
+              throw new Error('emulate colorScheme must be "light", "dark" or "auto"');
+            }
+            const result = await current.executeJavaScript(emulateJs(scheme));
+            themeState = scheme;
+            return { ok: true, scheme, ...(result !== null && typeof result === "object" ? result : {}) };
+          }
+          case "setContent": {
+            const current = await requireReady();
+            const html = String(command.html ?? "");
+            const baseUrl = typeof command.baseUrl === "string" && command.baseUrl !== "" ? command.baseUrl : undefined;
+            const rendered = injectBaseHref(html, baseUrl);
+            let context = "about:blank";
+            if (!isBlankUrl(readUrl())) {
+              // Get to a blank document so the HTML owns the whole page; if the
+              // shell/session refuses about:blank, render in place and say so.
+              context = "in-place";
+              try {
+                await current.loadURL("about:blank");
+                for (let attempt = 0; attempt < 10; attempt += 1) {
+                  await sleepImpl(150);
+                  if (isBlankUrl(readUrl())) break;
+                }
+                if (isBlankUrl(readUrl())) context = "about:blank";
+              } catch {
+                context = "in-place";
               }
             }
-            const ms = Math.max(0, Number(command.ms ?? 500));
-            await sleepImpl(ms);
-            return { ok: true, waitedMs: ms };
+            const result = await current.executeJavaScript(setContentJs(rendered.html));
+            lastSnapshot = undefined;
+            lastNavigation = { url: result?.url ?? "", title: result?.title ?? "" };
+            if (themeState !== "auto") {
+              try {
+                await current.executeJavaScript(emulateJs(themeState));
+              } catch {
+                // Best effort: the new document may still be parsing.
+              }
+            }
+            return {
+              ok: true,
+              context,
+              title: result?.title ?? "",
+              url: result?.url ?? "",
+              viewport: result?.viewport,
+              baseUrl: baseUrl ?? null,
+              injectedBase: rendered.injected === true,
+              warning: rendered.warning,
+              bytes: utf8Length(html),
+            };
+          }
+          case "close": {
+            const wasOpen = webview !== undefined;
+            unmount();
+            return { ok: true, closed: wasOpen };
           }
           case "screenshot": {
             const current = await requireReady();
-            if (typeof current.capturePage !== "function") throw new Error("capturePage is not available in this webview");
-            const image = await current.capturePage();
-            const dataUrl = typeof image?.toDataURL === "function" ? image.toDataURL() : undefined;
-            if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
-              throw new Error("capturePage did not return an image");
+            const format = command.format === "jpeg" ? "jpeg" : "png";
+            const quality = Math.max(1, Math.min(100, Number(command.quality ?? 80)));
+            const hideCursor = command.hideCursor !== false;
+            let rect;
+            let mode = "viewport";
+            let elementInfo;
+            let clipInfo;
+            let fullPageInfo;
+            let viewportInfo;
+            if (command.ref !== undefined || command.selector !== undefined) {
+              const target = await current.executeJavaScript(
+                screenshotTargetJs({
+                  ...(command.ref === undefined || command.ref === null ? {} : { ref: String(command.ref) }),
+                  ...(typeof command.selector === "string" && command.selector !== "" ? { selector: command.selector } : {}),
+                }),
+              );
+              if (target === undefined || target === null || target.ok !== true) {
+                throw new Error(target?.error ?? "screenshot target not found; take a snapshot first");
+              }
+              rect = target.rect;
+              viewportInfo = target.viewport;
+              elementInfo = { target: target.target, clippedToViewport: target.clipped === true };
+              mode = "element";
+            } else if (command.clip !== undefined && command.clip !== null) {
+              viewportInfo = await current.executeJavaScript(viewportInfoJs());
+              rect = clampRect(command.clip, viewportInfo);
+              if (rect === undefined) throw new Error("screenshot clip is outside the viewport");
+              clipInfo = rect;
+              mode = "clip";
+            } else if (command.fullPage === true) {
+              mode = "fullPage";
             }
-            return { ok: true, dataUrl };
+            let cursorHidden = false;
+            let previousHeight;
+            try {
+              if (hideCursor) {
+                try {
+                  await current.executeJavaScript(cursorVisibilityJs(true));
+                  cursorHidden = true;
+                } catch {
+                  cursorHidden = false;
+                }
+              }
+              if (mode === "fullPage") {
+                const state = await current.executeJavaScript(scrollStateJs());
+                const requestedHeight = Math.max(1, Number(state?.scrollHeight ?? 0));
+                const capturedHeight = Math.max(1, Math.min(requestedHeight, fullPageMaxCssPx));
+                const element = webview;
+                previousHeight = element === undefined ? undefined : String(element.style.height ?? "");
+                if (element !== undefined) {
+                  // Temporarily grow the guest viewport so one capture covers the
+                  // whole page. vh-based layouts reflow during the capture (see docs).
+                  element.style.height = `${capturedHeight}px`;
+                  element.style.flex = "0 0 auto";
+                }
+                fullPageInfo = { requestedHeight, capturedHeight, capped: requestedHeight > fullPageMaxCssPx };
+                await sleepImpl(180);
+              }
+              if (typeof current.capturePage !== "function") throw new Error("capturePage is not available in this webview");
+              const image = rect === undefined ? await current.capturePage() : await current.capturePage(rect);
+              const dataUrl = imageToDataUrl(image, format, quality);
+              if (viewportInfo === undefined || viewportInfo === null) {
+                try {
+                  viewportInfo = await current.executeJavaScript(viewportInfoJs());
+                } catch {
+                  viewportInfo = undefined;
+                }
+              }
+              if (viewportInfo === null) viewportInfo = undefined;
+              return {
+                ok: true,
+                dataUrl,
+                format,
+                mode,
+                width: rect?.width,
+                height: rect?.height,
+                clip: clipInfo,
+                element: elementInfo,
+                fullPage: fullPageInfo,
+                viewport:
+                  viewportInfo === undefined
+                    ? undefined
+                    : { width: viewportInfo.innerWidth, height: viewportInfo.innerHeight },
+                devicePixelRatio: viewportInfo?.devicePixelRatio,
+                hideCursor,
+              };
+            } finally {
+              if (mode === "fullPage") {
+                const element = webview;
+                if (element !== undefined) {
+                  element.style.height = previousHeight !== undefined && previousHeight !== "" ? previousHeight : "100%";
+                  // Keep the fixed-viewport flex basis; only auto layout returns
+                  // to the panel-sized flex default.
+                  element.style.flex = viewportState === undefined ? "" : "0 0 auto";
+                }
+                await sleepImpl(80);
+              }
+              if (cursorHidden) {
+                try {
+                  await current.executeJavaScript(cursorVisibilityJs(false));
+                } catch {
+                  // The page may have navigated away mid-capture.
+                }
+              }
+            }
           }
           default:
             return { ok: false, error: `unknown command "${type}"` };
@@ -820,7 +1910,20 @@ window.__ModuleLoader__.load({
         } catch {
           url = "";
         }
-        return { ready, hasWebview: webview !== undefined, url, title: lastSnapshot?.title ?? "" };
+        return {
+          ready,
+          hasWebview: webview !== undefined,
+          url,
+          title: lastSnapshot?.title ?? lastNavigation.title ?? "",
+          viewport:
+            viewportState === undefined
+              ? { auto: true }
+              : { width: viewportState.width, height: viewportState.height, scale: viewportState.scale, auto: false },
+          theme: themeState,
+          console: { errors: consoleCounts.error, warnings: consoleCounts.warning, total: consoleTotal, buffer: consoleLog.length },
+          lastUrl: lastNavigation.url || url,
+          lastTitle: lastNavigation.title || lastSnapshot?.title || "",
+        };
       }
 
       return { mount, ensureMounted, unmount, waitReady, handle, status, _internals: { get webview() { return webview; } } };
@@ -1024,7 +2127,19 @@ window.__ModuleLoader__.load({
           void postDiag("panel", { phase: "apply-failed", error: String(error && error.message ? error.message : error) });
         }
       },
-      __test: { createPanelController },
+      __test: {
+        createPanelController,
+        rewriteColorSchemeQuery,
+        injectBaseHref,
+        clampRect,
+        bytesToBase64,
+        imageToDataUrl,
+        isBlankUrl,
+        emulateJs,
+        setContentJs,
+        metricsJs,
+        waitConditionsJs,
+      },
     };
   },
 });

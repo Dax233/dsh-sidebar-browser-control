@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-sidebar-browser-control",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Sidebar Agent Browser for DeepSeek Harness: an owned webview plus Agent tools (snapshot/click/type/scroll) driven through a loopback bridge, with an in-page virtual cursor that never moves the user's real mouse.",
+  "description": "Sidebar Agent Browser for DeepSeek Harness: an owned webview plus Agent tools (snapshot/click/type/scroll) driven through a loopback bridge, with an in-page virtual cursor that never moves the user's real mouse, plus QA actions for viewport/evaluate/metrics/screenshots/theme emulation and local preview.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -14,6 +14,7 @@
     "index.js",
     "bridge.js",
     "client.js",
+    "lib/preview.js",
     "cordis.patch.yml",
     "README.md",
     "locale/*.json",
@@ -35,7 +36,7 @@
   },
   "license": "MIT",
   "scripts": {
-    "test": "node --test tests/bridge.test.mjs tests/browser-control-client.test.mjs tests/browser-control-host.test.mjs"
+    "test": "node --test tests/bridge.test.mjs tests/browser-control-client.test.mjs tests/browser-control-host.test.mjs tests/browser-control-scripts.test.mjs tests/preview.test.mjs"
   },
   "repository": {
     "type": "git",

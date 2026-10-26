@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -13,7 +13,28 @@ process.env.DSH_BROWSER_CONTROL_SHOT_DIR = join(mkdtempSync(join(tmpdir(), "dsh-
 
 const plugin = await import("../index.js");
 
-const EXPECTED_ACTIONS = ["open", "navigate", "snapshot", "click", "type", "key", "scroll", "wait", "status", "screenshot"];
+const EXPECTED_ACTIONS = [
+  "open",
+  "navigate",
+  "snapshot",
+  "click",
+  "type",
+  "key",
+  "scroll",
+  "scrollIntoView",
+  "wait",
+  "status",
+  "screenshot",
+  "viewport",
+  "evaluate",
+  "metrics",
+  "logs",
+  "emulate",
+  "setContent",
+  "preview",
+  "qa",
+  "close",
+];
 
 function makeContext() {
   const tools = [];
@@ -175,9 +196,101 @@ function startFakeClient(port, received, isStopped) {
       case "key":
         return { ok: true, key: command.key, settle: { settled: true, mutations: 0 }, changed: false };
       case "scroll":
-        return { ok: true, deltaY: command.deltaY, scrollY: 250, scrollHeight: 2400, innerHeight: 742 };
+        return { ok: true, deltaY: command.deltaY, requestedDelta: command.deltaY, actualDelta: 250, scrollY: 250, scrollHeight: 2400, innerHeight: 742 };
       case "screenshot":
-        return { ok: true, dataUrl: "data:image/png;base64," + Buffer.from("fake-png-bytes").toString("base64") };
+        return {
+          ok: true,
+          dataUrl: makePng(320, 240),
+          format: "png",
+          mode: command.fullPage === true ? "fullPage" : "viewport",
+          devicePixelRatio: 1,
+          ...(command.fullPage === true ? { fullPage: { requestedHeight: 24000, capturedHeight: 12000, capped: true } } : {}),
+        };
+      case "viewport":
+        return {
+          ok: true,
+          width: command.width,
+          height: command.height,
+          scale: 0.5,
+          ...(command.reset === true ? { reset: true } : {}),
+          actual: { innerWidth: command.width ?? 575, innerHeight: command.height ?? 742, devicePixelRatio: 1 },
+        };
+      case "evaluate":
+        return { ok: true, result: { answer: 42 } };
+      case "metrics":
+        return {
+          ok: true,
+          metrics: {
+            title: "Example Domain",
+            url: "https://example.com/",
+            viewport: { width: 1280, height: 800, devicePixelRatio: 1, scrollY: 0 },
+            document: { scrollWidth: 1280, scrollHeight: 2400, contentWidth: 1280 },
+            overflow: [{ selector: "div#wide", right: 1500, overshoot: 220 }],
+            overflowCount: 1,
+            images: { total: 3, loaded: 2, failed: 1, failedSrc: ["https://example.com/broken.png"] },
+            fonts: { status: "loaded", size: 2 },
+            console: { errors: 1, warnings: 2, total: 3, entries: 3 },
+            selectors: [{ selector: ".hero", found: true, rect: { x: 0, y: 0, width: 300, height: 200 } }],
+          },
+        };
+      case "wait":
+        return { ok: true, waitedMs: command.ms ?? 500, mode: command.selector === undefined ? "sleep" : "conditions", conditions: { selector: true } };
+      case "scrollIntoView":
+        return {
+          ok: true,
+          scrollY: 640,
+          scrollHeight: 2400,
+          innerHeight: 800,
+          inViewport: true,
+          target: { selector: command.selector, ref: command.ref },
+        };
+      case "logs":
+        return {
+          ok: true,
+          entries: [
+            { level: "error", message: "Uncaught boom", line: 1, source: "a.js" },
+            { level: "warning", message: "deprecated", line: 2, source: "b.js" },
+          ],
+          matched: 2,
+          bufferSize: 2,
+          bufferLimit: 200,
+          totalSeen: 2,
+          clearedCount: command.clear === true ? 2 : 0,
+          probe: { failedImages: [{ src: "https://example.com/broken.png" }], resourceCount: 6, resources: [] },
+        };
+      case "emulate":
+        return {
+          ok: true,
+          scheme: command.colorScheme,
+          matchMediaOverridden: command.colorScheme !== "auto",
+          sheets: { scanned: 2, patched: 1, crossOrigin: 0, unreadable: 0 },
+          mediaRules: { patched: 1, restored: 0 },
+          verified: { darkMatches: command.colorScheme === "dark", lightMatches: command.colorScheme === "light" },
+        };
+      case "setContent":
+        return {
+          ok: true,
+          context: "about:blank",
+          title: "Local Content",
+          url: "about:blank",
+          viewport: { width: 575, height: 742, devicePixelRatio: 1 },
+          baseUrl: command.baseUrl ?? null,
+          injectedBase: command.baseUrl !== undefined,
+          bytes: command.html.length,
+        };
+      case "close":
+        return { ok: true, closed: true };
+      case "status":
+        return {
+          ok: true,
+          ready: true,
+          hasWebview: true,
+          viewport: { width: 1280, height: 800, scale: 0.5, auto: false },
+          theme: "light",
+          console: { errors: 2, warnings: 1, total: 3, buffer: 3 },
+          lastUrl: "https://example.com/",
+          lastTitle: "Example Domain",
+        };
       default:
         return { ok: true };
     }
@@ -227,4 +340,410 @@ test("click receipt warns when the action produced no observable change", () => 
     settle: { settled: true, mutations: 1 },
   });
   assert.match(covered, /appears covered/);
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 QA surface: dispatch, validation, receipts, qa/preview/status/close
+// ---------------------------------------------------------------------------
+
+async function withHarness(run) {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  try {
+    return await run(harness);
+  } finally {
+    harness.disposeAll();
+  }
+}
+
+async function withFakeClient(tool, run) {
+  let stopped = false;
+  const received = [];
+  const port = await waitForPort(tool);
+  const client = startFakeClient(port, received, () => stopped);
+  try {
+    return await run(received, port);
+  } finally {
+    stopped = true;
+    client.promise.catch(() => {});
+  }
+}
+
+/** Minimal valid PNG header (signature + IHDR) — enough for parseImageSize. */
+function makePng(width, height) {
+  const bytes = Buffer.alloc(8 + 4 + 4 + 13 + 4);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes, 0);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write("IHDR", 12, "ascii");
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  bytes[24] = 8;
+  bytes[25] = 6;
+  return `data:image/png;base64,${bytes.toString("base64")}`;
+}
+
+/** Minimal JPEG header with a SOF0 segment carrying the frame size. */
+function makeJpeg(width, height) {
+  const bytes = Buffer.alloc(32);
+  bytes[0] = 0xff;
+  bytes[1] = 0xd8;
+  bytes[2] = 0xff;
+  bytes[3] = 0xc0;
+  bytes.writeUInt16BE(17, 4);
+  bytes[6] = 8;
+  bytes.writeUInt16BE(height, 7);
+  bytes.writeUInt16BE(width, 9);
+  return bytes;
+}
+
+test("0.2.0 host dispatch: toCommand builds and validates every new action", () => {
+  const { toCommand } = plugin.__test;
+  assert.deepEqual(toCommand("viewport", { width: 390 }), { type: "viewport", width: 390, height: 800 });
+  assert.deepEqual(toCommand("viewport", { reset: true }), { type: "viewport", reset: true });
+  assert.throws(() => toCommand("viewport", {}), /width/);
+  assert.throws(() => toCommand("viewport", { width: 10 }), /between/);
+  assert.deepEqual(toCommand("evaluate", { expression: "document.title" }), { type: "evaluate", expression: "document.title" });
+  assert.throws(() => toCommand("evaluate", {}), /expression/);
+  assert.deepEqual(toCommand("metrics", { selectors: [".hero", ".hero"], includeOverflow: false }), {
+    type: "metrics",
+    includeOverflow: false,
+    selectors: [".hero"],
+  });
+  assert.deepEqual(toCommand("wait", { selector: "#ready", networkIdle: true, idleMs: 300 }), {
+    type: "wait",
+    selector: "#ready",
+    networkIdle: true,
+    idleMs: 300,
+    ms: 8000,
+  });
+  assert.deepEqual(toCommand("wait", { ms: 250 }), { type: "wait", ms: 250 });
+  assert.deepEqual(toCommand("wait", {}), { type: "wait", ms: 500 });
+  assert.throws(() => toCommand("wait", { idleMs: 999999 }), /idleMs/);
+  assert.deepEqual(toCommand("scrollIntoView", { selector: ".x" }), { type: "scrollIntoView", selector: ".x", block: "center" });
+  assert.deepEqual(toCommand("scroll", { deltaY: "300" }), { type: "scroll", deltaY: 300 });
+  assert.throws(() => toCommand("scrollIntoView", {}), /ref or selector/);
+  assert.throws(() => toCommand("scrollIntoView", { ref: "e1", block: "middle" }), /block/);
+  assert.deepEqual(toCommand("logs", { filter: "boom" }), { type: "logs", clear: false, limit: 50, filter: "boom" });
+  assert.throws(() => toCommand("logs", { limit: 0 }), /limit/);
+  assert.deepEqual(toCommand("emulate", { colorScheme: "dark" }), { type: "emulate", colorScheme: "dark" });
+  assert.throws(() => toCommand("emulate", {}), /colorScheme/);
+  assert.deepEqual(toCommand("setContent", { html: "<h1>hi</h1>", baseUrl: "https://example.com/" }), {
+    type: "setContent",
+    html: "<h1>hi</h1>",
+    baseUrl: "https://example.com/",
+  });
+  assert.throws(() => toCommand("setContent", { html: "<p>x</p>", baseUrl: "file:///etc/passwd" }), /http/);
+  assert.throws(() => toCommand("setContent", { html: "x".repeat(2 * 1024 * 1024 + 1) }), /limit/);
+  assert.deepEqual(toCommand("preview", { dir: "C:\\site", file: "index.html", port: 5000 }), {
+    type: "preview",
+    dir: "C:\\site",
+    file: "index.html",
+    port: 5000,
+  });
+  assert.throws(() => toCommand("preview", { dir: "" }), /dir/);
+  assert.throws(() => toCommand("preview", { dir: "relative\\site" }), /absolute/);
+  assert.throws(() => toCommand("preview", { dir: "C:\\site", port: 70000 }), /port/);
+  assert.deepEqual(toCommand("close", {}), { type: "close" });
+});
+
+test("0.2.0 host dispatch: screenshot validates format/clip/path/fullPage and hides the cursor by default", () => {
+  const { toCommand } = plugin.__test;
+  const absoluteShot = join(tmpdir(), "shot.jpg");
+  const full = toCommand("screenshot", { fullPage: true, format: "jpeg", quality: 55, path: absoluteShot });
+  assert.equal(full.fullPage, true);
+  assert.equal(full.format, "jpeg");
+  assert.equal(full.quality, 55);
+  assert.equal(full.path, absoluteShot);
+  assert.equal(full.hideCursor, true);
+  assert.throws(() => toCommand("screenshot", { format: "gif" }), /format/);
+  assert.throws(() => toCommand("screenshot", { quality: 101 }), /quality/);
+  assert.throws(() => toCommand("screenshot", { clip: { width: 100 } }), /clip\.height/);
+  assert.throws(() => toCommand("screenshot", { clip: { x: 0, y: 0, width: 100, height: -5 } }), /positive/);
+  assert.throws(() => toCommand("screenshot", { path: "relative.png" }), /absolute/);
+  assert.throws(() => toCommand("screenshot", { fullPage: true, clip: { x: 0, y: 0, width: 10, height: 10 } }), /cannot be combined/);
+  const element = toCommand("screenshot", {
+    clip: { x: 10, y: 20, width: 300, height: 200 },
+    selector: ".hero",
+    hideCursor: false,
+  });
+  assert.deepEqual(element.clip, { x: 10, y: 20, width: 300, height: 200 });
+  assert.equal(element.selector, ".hero");
+  assert.equal(element.hideCursor, false);
+});
+
+test("0.2.0 host dispatch: qa plan enforces the variant cap and validates widths/themes", () => {
+  const { buildQaPlan } = plugin.__test;
+  const plan = buildQaPlan({
+    url: "https://example.com/",
+    widths: [640],
+    themes: ["light", "dark"],
+    height: 700,
+    outDir: join(tmpdir(), "qa-out"),
+    fullPage: true,
+    selectors: [".hero"],
+  });
+  assert.equal(plan.variants.length, 2);
+  assert.deepEqual(plan.variants, [
+    { width: 640, theme: "light" },
+    { width: 640, theme: "dark" },
+  ]);
+  assert.equal(plan.height, 700);
+  assert.equal(plan.fullPage, true);
+  assert.equal(plan.selectors[0], ".hero");
+  assert.throws(
+    () => buildQaPlan({ url: "https://example.com/", widths: [640, 768, 800], themes: ["light", "dark", "auto"] }),
+    /variants/,
+  );
+  assert.throws(() => buildQaPlan({ url: "https://example.com/", maxVariants: 7 }), /maxVariants/);
+  assert.throws(() => buildQaPlan({ url: "https://example.com/", themes: ["sepia"] }), /themes/);
+  assert.throws(() => buildQaPlan({ url: "ftp://example.com/" }), /http/);
+  const defaults = buildQaPlan({ url: "https://example.com/" });
+  assert.deepEqual(defaults.widths, [1280, 768, 375]);
+  assert.deepEqual(defaults.themes, ["light", "dark"]);
+  assert.equal(defaults.variants.length, 6, "the default matrix is exactly the hard cap");
+});
+
+test("0.2.0 host helpers: parseImageSize reads PNG/JPEG headers and truncateJson enforces the 16KB budget", () => {
+  const png = Buffer.from(makePng(321, 123).replace(/^data:image\/png;base64,/u, ""), "base64");
+  assert.deepEqual(plugin.__test.parseImageSize(png), { format: "png", width: 321, height: 123 });
+  const jpeg = makeJpeg(200, 100);
+  assert.deepEqual(plugin.__test.parseImageSize(jpeg), { format: "jpeg", width: 200, height: 100 });
+  assert.equal(plugin.__test.parseImageSize(Buffer.from("not an image")), undefined);
+  const small = plugin.__test.truncateJson({ ok: true });
+  assert.equal(small.truncated, false);
+  const big = plugin.__test.truncateJson("x".repeat(plugin.__test.MAX_EVALUATE_BYTES * 2));
+  assert.equal(big.truncated, true);
+  assert.match(big.text, /truncated: result is \d+ bytes, limit 16384 bytes/);
+});
+
+test("0.2.0 host receipts: new actions format compact, actionable text", () => {
+  const { formatResult: format } = plugin.__test;
+  assert.match(
+    format("viewport", { width: 1280, height: 800, scale: 0.375, actual: { innerWidth: 1280, innerHeight: 800, devicePixelRatio: 1 } }),
+    /viewport: 1280x800 requested; actual 1280x800 \(devicePixelRatio 1\); panel scale 0\.375/,
+  );
+  assert.match(
+    format("viewport", { reset: true, actual: { innerWidth: 575, innerHeight: 742, devicePixelRatio: 1 } }),
+    /viewport reset to panel size: 575x742/,
+  );
+  const metrics = format("metrics", {
+    metrics: {
+      title: "T",
+      url: "https://e/",
+      viewport: { width: 1280, height: 800, devicePixelRatio: 1, scrollY: 0 },
+      document: { scrollWidth: 1280, scrollHeight: 2400, contentWidth: 1280 },
+      overflow: [{ selector: "div#wide", right: 1500, overshoot: 220 }],
+      overflowCount: 1,
+      images: { total: 3, loaded: 2, failed: 1, failedSrc: ["https://e/broken.png"] },
+      fonts: { status: "loaded", size: 2 },
+      console: { errors: 1, warnings: 2 },
+      selectors: [
+        { selector: ".hero", found: true, rect: { x: 0, y: 0, width: 300, height: 200 } },
+        { selector: ".missing", found: false },
+      ],
+    },
+  });
+  assert.match(metrics, /metrics: T https:\/\/e\//);
+  assert.match(metrics, /overflow: 1 element\(s\) wider than the viewport/);
+  assert.match(metrics, /images: 3 total, 2 loaded, 1 failed/);
+  assert.match(metrics, /console: 1 error\(s\), 2 warning\(s\)/);
+  assert.match(metrics, /\.hero: 300x200/);
+  assert.match(metrics, /\.missing: not found/);
+  const logs = format("logs", {
+    entries: [{ level: "error", message: "boom" }],
+    matched: 1,
+    bufferSize: 1,
+    bufferLimit: 200,
+    totalSeen: 1,
+    clearedCount: 1,
+    probe: { failedImages: [{ src: "https://e/x.png" }], resources: [], resourceCount: 2 },
+  });
+  assert.match(logs, /cleared 1 buffered entry/);
+  assert.match(logs, /\[error\] boom/);
+  assert.match(logs, /failed images \(1\)/);
+  const emulate = format("emulate", {
+    scheme: "dark",
+    sheets: { scanned: 2, patched: 1, crossOrigin: 1 },
+    mediaRules: { patched: 1 },
+    verified: { darkMatches: true, lightMatches: false },
+  });
+  assert.match(emulate, /emulated prefers-color-scheme: dark/);
+  assert.match(emulate, /1 cross-origin unreadable/);
+  const content = format("setContent", {
+    context: "about:blank",
+    title: "Local",
+    viewport: { width: 575, height: 742 },
+    injectedBase: true,
+    baseUrl: "https://e/",
+  });
+  assert.match(content, /setContent: "Local" in about:blank/);
+  assert.match(content, /<base> injected/);
+  assert.match(content, /file:\/\/ is unavailable/);
+  const inPlace = format("setContent", { context: "in-place", title: "x", viewport: {} });
+  assert.match(inPlace, /rendered in place/);
+  const scroll = format("scroll", {
+    requestedDelta: 400,
+    actualDelta: 0,
+    scrollY: 0,
+    scrollHeight: 2400,
+    innerHeight: 742,
+    clamped: true,
+    method: "script",
+  });
+  assert.match(scroll, /requested 400px, actual 0px/);
+  assert.match(scroll, /clamped at document edge/);
+  assert.match(scroll, /\[script fallback\]/);
+  assert.match(
+    format("scrollIntoView", { scrollY: 640, scrollHeight: 2400, innerHeight: 800, inViewport: true, target: { label: "Section" } }),
+    /scrolled into view "Section" — scrollY 640/,
+  );
+  assert.match(format("wait", { waitedMs: 320, conditions: { selector: true, text: true } }), /waited 320ms \(selector found, text found\)/);
+  assert.match(format("close", { closed: true }), /browser closed/);
+  assert.match(format("close", { closed: false }), /no panel was open/);
+  assert.match(format("evaluate", { result: { answer: 42 } }), /"answer": 42/);
+});
+
+test("0.2.0 host round-trip: QA actions dispatch through the bridge and format receipts", async () => {
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(tool, async (received) => {
+      const viewport = await tool.execute({ action: "viewport", width: 390 });
+      assert.match(viewport.text, /viewport: 390x800 requested; actual 390x800/);
+      const evaluate = await tool.execute({ action: "evaluate", expression: "1+1" });
+      assert.match(evaluate.text, /"answer": 42/);
+      const metrics = await tool.execute({ action: "metrics", selectors: [".hero"] });
+      assert.match(metrics.text, /images: 3 total, 2 loaded, 1 failed/);
+      const waited = await tool.execute({ action: "wait", selector: "#ready" });
+      assert.match(waited.text, /waited 8000ms \(selector found\)/);
+      const intoView = await tool.execute({ action: "scrollIntoView", selector: "#section-2" });
+      assert.match(intoView.text, /scrolled into view.*scrollY 640/);
+      const logs = await tool.execute({ action: "logs", filter: "boom" });
+      assert.match(logs.text, /\[error\] Uncaught boom/);
+      assert.match(logs.text, /failed images/);
+      const emulate = await tool.execute({ action: "emulate", colorScheme: "dark" });
+      assert.match(emulate.text, /emulated prefers-color-scheme: dark/);
+      const content = await tool.execute({ action: "setContent", html: "<title>Local</title>", baseUrl: "https://example.com/" });
+      assert.match(content.text, /setContent: "Local Content"/);
+      const closed = await tool.execute({ action: "close" });
+      assert.match(closed.text, /browser closed/);
+      assert.deepEqual(
+        received.map((command) => command.type),
+        ["viewport", "evaluate", "metrics", "wait", "scrollIntoView", "logs", "emulate", "setContent", "close"],
+      );
+      assert.deepEqual(received[0], { type: "viewport", width: 390, height: 800 });
+      assert.equal(received[1].expression, "1+1");
+      assert.equal(received[5].filter, "boom");
+      assert.equal(received[6].colorScheme, "dark");
+      assert.equal(received[7].baseUrl, "https://example.com/");
+    });
+  });
+});
+
+test("0.2.0 host screenshot: saves to an absolute path, parses real pixels, and reports fullPage caps", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh-bc-shot-"));
+  const target = join(dir, "evidence.png");
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(tool, async (received) => {
+      const result = await tool.execute({ action: "screenshot", fullPage: true, path: target });
+      assert.match(result.text, /screenshot saved:/);
+      assert.match(result.text, /320x240px/);
+      assert.match(result.text, /full page: captured 12000 of 24000 CSS px \(capped at 12000/);
+      assert.equal(existsSync(target), true, "the screenshot must be written to the requested absolute path");
+      assert.deepEqual(plugin.__test.parseImageSize(readFileSync(target)), { format: "png", width: 320, height: 240 });
+      assert.equal(received[0].fullPage, true);
+      assert.equal(received[0].hideCursor, true);
+      assert.match(result.text, /read_image/);
+    });
+  });
+});
+
+test("0.2.0 host qa: runs a width x theme matrix, saves screenshots, and resets the panel", async () => {
+  const outDir = mkdtempSync(join(tmpdir(), "dsh-bc-qa-"));
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(tool, async (received) => {
+      const result = await tool.execute({
+        action: "qa",
+        url: "https://example.com/",
+        widths: [640],
+        themes: ["light", "dark"],
+        height: 700,
+        outDir,
+        selectors: [".hero"],
+      });
+      assert.match(result.text, /qa: https:\/\/example\.com\//);
+      assert.match(result.text, /variants: 2/);
+      assert.match(result.text, /640x700 light:/);
+      assert.match(result.text, /640x700 dark:/);
+      const types = received.map((command) => command.type);
+      assert.deepEqual(types.slice(0, 5), ["navigate", "viewport", "emulate", "wait", "metrics"]);
+      assert.equal(types.filter((type) => type === "screenshot").length, 2);
+      assert.equal(types.at(-2), "viewport");
+      assert.equal(types.at(-1), "emulate");
+      assert.equal(received.at(-2).reset, true, "qa must leave the viewport back on auto");
+      assert.equal(received.at(-1).colorScheme, "auto", "qa must leave the theme back on auto");
+      assert.equal(received[1].height, 700);
+      for (const theme of ["light", "dark"]) {
+        const file = join(outDir, `qa-640x700-${theme}.png`);
+        assert.equal(existsSync(file), true, `qa must save ${file}`);
+        assert.deepEqual(plugin.__test.parseImageSize(readFileSync(file)), { format: "png", width: 320, height: 240 });
+      }
+    });
+  });
+});
+
+test("0.2.0 host preview: serves a local directory over a tokenized loopback URL and reuses the server", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh-bc-preview-"));
+  writeFileSync(join(dir, "index.html"), "<title>Preview</title><h1>local</h1>");
+  let servedUrl;
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(tool, async (received) => {
+      const first = await tool.execute({ action: "preview", dir });
+      const match = /preview served: (http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32}\/)/u.exec(first.text);
+      assert.ok(match, `preview receipt must contain the tokenized URL, got: ${first.text}`);
+      servedUrl = match[1];
+      const response = await fetch(servedUrl);
+      assert.equal(response.status, 200);
+      assert.match(await response.text(), /local/);
+      assert.equal(received[0].type, "open");
+      assert.equal(received[0].url, servedUrl);
+      const second = await tool.execute({ action: "preview", dir });
+      assert.match(second.text, /reused a 127\.0\.0\.1 static server/);
+      assert.equal(/preview served: (\S+)/u.exec(second.text)[1], servedUrl, "the same directory reuses the running server");
+      assert.equal(received.length, 2);
+      const missing = await tool.execute({ action: "preview", dir: join(dir, "does-not-exist") });
+      assert.match(missing.text, /browser preview failed/);
+    });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await assert.rejects(() => fetch(servedUrl), /fetch failed|ECONNREFUSED|connect/iu, "dispose must close the preview server");
+});
+
+test("0.2.0 host status: merges connected-client viewport/theme/console/last url with bridge fields", async () => {
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(tool, async (received) => {
+      let status = {};
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const raw = await tool.execute({ action: "status" });
+        status = JSON.parse(raw.text);
+        if (status.freshClients.length > 0 && status.client !== undefined) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(typeof status.listening, "boolean");
+      assert.ok(status.port > 0);
+      assert.equal(status.freshClients.length, 1);
+      assert.equal(status.viewport.width, 1280);
+      assert.equal(status.viewport.scale, 0.5);
+      assert.equal(status.theme, "light");
+      assert.equal(status.console.errors, 2);
+      assert.equal(status.console.warnings, 1);
+      assert.equal(status.lastUrl, "https://example.com/");
+      assert.equal(status.lastTitle, "Example Domain");
+      assert.equal(status.client.hasWebview, true);
+      assert.equal(received.at(-1).type, "status");
+    });
+  });
 });

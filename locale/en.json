@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Agent Browser",
-    "description": "Lets the agent drive a sidebar browser (open, snapshot, click, type, scroll) with a visible cursor beside the page; the user's mouse is never moved."
+    "description": "Lets the agent drive a sidebar browser (open, snapshot, click, type, scroll) with a visible cursor beside the page, plus QA tools for viewport sizing, page evaluation/metrics, waiting, light/dark emulation, full-page screenshots and batch width x theme checks; the user's mouse is never moved."
   }
 }

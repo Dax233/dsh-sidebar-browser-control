@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Agent 浏览器",
-    "description": "让 Agent 操控侧边栏里的浏览器（打开、读取页面、点击、输入、滚动），并在页面旁显示 Agent 光标；不会移动用户的真实鼠标。"
+    "description": "让 Agent 操控侧边栏里的浏览器（打开、读取页面、点击、输入、滚动），并在页面旁显示 Agent 光标；同时提供 QA 能力（viewport 视口、evaluate/metrics 页面测量、资源等待、明暗主题模拟、整页截图、批量 width×theme 验收），不会移动用户的真实鼠标。"
   }
 }

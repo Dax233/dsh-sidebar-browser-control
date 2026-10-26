@@ -562,3 +562,85 @@ token 移出 WS query。
 - 0.1.24：iframe 点击成功后 `changed` 记为 true，不再输出误导性的 "no observable change inside the frame"。
 
 0.1.24 受控复验（2026-10-24）：点击 iframe 内 `GO TO INNER TWO` 输出 `(iframe script click)` 且无 no-observable-change 提示；`contentDocument.location.href` = `/inner2.html`，title/h1 = `Inner Two`。
+
+## 34. QA 能力（2026-10-26，0.1.0 → 0.2.0）
+
+背景见 `dsh-plugins/research/feedback-triage-2026-10-26.md` §1/§3/§5：真实工程验收（改 GitHub 主页后
+明/暗 × 桌面/手机 4 组验收）暴露了侧栏浏览器缺 viewport / evaluate / 资源等待 / 证据截图 / 批量回归，
+这些可以在「页面 JS + webview DOM API」内完成；DPR、媒体仿真、网络状态码与离屏/CI 需要 CDP 或
+Electron 主进程，**不在插件能力内，不做伪造**。
+
+### 34.1 新增工具面
+
+| action | 实现位置 | 关键事实 |
+|---|---|---|
+| `viewport {width,height=800,reset}` | Client 设 webview 元素 CSS 尺寸 + 面板内 `transform: scale()` | guest 视口 = 元素尺寸（真实布局）；面板缩放不改变 guest 布局；回执报真实 `innerWidth/innerHeight/devicePixelRatio` |
+| `evaluate {expression}` | `executeJavaScript` 包装 | 返回 JSON；Client 侧 200KB 保护桥 1MB body 上限，Host 回执再按 16KB 截断并标注 |
+| `metrics {selectors?,includeOverflow?}` | 页面脚本 `__dshAgentMetrics` + console 计数合并 | viewport/document/内容宽/横向溢出 top20/图片/`document.fonts`/console 错误警告/选择器 rect |
+| `wait` 扩展 | 页面脚本 `__dshAgentWait` 内轮询 | selector/text/networkIdle(idleMs)/images/fonts；`ms` 既是超时也是纯等待；networkIdle 是「资源计数 + DOM 突变静默」近似 |
+| `scroll` 扩展 + `scrollIntoView` | Client 轮询滚动状态 + 页面脚本 | 回执 requested/actualDelta/scrollY/scrollHeight/innerHeight/clamped/method（wheel 失效时脚本兜底）；scrollIntoView 支持 ref/selector + block |
+| `logs {clear,filter,limit}` | mount 时监听 webview `console-message` 环形缓冲（≤200） + 页面脚本 `__dshAgentLogsProbe` | 附带失败图片/可疑资源条目；**HTTP 状态码不可见**（见 34.4） |
+| `screenshot` 扩展 | Client capturePage + Host 落盘 | fullPage 临时拉高 webview 到 scrollHeight（≤12000 CSS px，capped）；元素/区域走 `capturePage(rect)`；hideCursor 默认隐藏虚拟光标；Host 解析 PNG/JPEG 头得到实际像素尺寸；不伪造 2x |
+| `emulate {colorScheme}` | 页面脚本 `__dshAgentEmulate` | matchMedia 覆盖（`prefers-color-scheme` 条件替换为 width 条件求值，支持组合/not）+ 同源 @media 规则归一化 all/not all（可恢复、递归 group rule、MutationObserver/短轮询补扫）；跨域样式表不可读；导航后自动重放（open/navigate，以及会替换文档的 click/key） |
+| `setContent {html,baseUrl}` | 页面脚本 `__dshAgentSetContent` | `document.open/write/close` 渲染自包含 HTML；baseUrl 只收 http(s) 并注入 `<base>`；≤2MB；优先 about:blank（若壳/会话拒绝则如实报 in-place） |
+| `preview {dir,file?,port?}` | Host 新文件 `lib/preview.js` | `dir` 必须是绝对路径（Host 相对路径会解析到 DSH 安装目录）；127.0.0.1 + 随机 token 路径前缀、GET/HEAD、realpath 防穿越、MIME 表、无目录列表、单文件 >64MiB 拒绝(413)、dispose 关闭；action 起/复用服务后让 client `open` 该 URL |
+| `qa {...}` | Host 编排多条 client 命令 | width×theme 矩阵一次跑完（≤6 variants）；每 width 导航一次（`navigate` 会在面板未开时先打开它）、每 theme 应用 emulate→短等待→metrics→screenshot；Host 保存 `qa-<width>x<height>-<theme>.png`；结束恢复 viewport/theme 为 auto |
+| `close` | Client `unmount()` | 释放 webview/lease；`open` 用保留的 panel 容器重新 mount 新的 leased webview |
+| `status` 扩展 | Client status + Host 合并 | 保留 bridge 字段，新增 viewport/theme/console 计数/last url/title |
+
+桥的改动：`pushCommand(cmd, timeoutMs?)` 支持**单命令超时覆盖**（qa 的 navigate/screenshot 用
+`DSH_BROWSER_CONTROL_QA_TIMEOUT_MS`，默认 120s），队列过期过滤也用命令自己的超时，避免长命令被
+全局 25s 误丢。
+
+### 34.2 设计取舍
+
+- **qa 在 Host 编排而不是塞进一个 client 命令**：每条子命令都有独立超时/错误定位，截图 data URL
+  逐张落盘，不把多张 base64 塞进一个 HTTP 响应；配合单命令超时覆盖既简单又可单测。
+- **viewport 用「元素尺寸 + 面板缩放」**：Electron `<webview>` 的 guest 视口跟随元素 CSS 尺寸，
+  这是真实布局；面板用 `transform: scale` 只影响显示，所以 `sendInputEvent` 的 guest 坐标不受影响。
+- **主题用 width 条件替换**：`(prefers-color-scheme: dark)` → `(min-width: 0px)`（真）、
+  `(min-width: 100000px)`（假），其它条件（and/not/媒体类型）原样保留后交给真实 matchMedia 求值；
+  再用同样的重写结果决定同源 `@media` 规则置 `all`/`not all`，全部可恢复。
+- **页面脚本集中生成**：`__dshAgent*` 标记注释 + `__test` 暴露纯函数/脚本生成器
+  （`rewriteColorSchemeQuery`、`emulateJs`、`metricsJs`、`waitConditionsJs`、`setContentJs`、
+  `injectBaseHref`、`clampRect`、`bytesToBase64`），在 Node VM 里用假页面对象做行为单测。
+- **navigate 也会开面板**：与 `open` 共用同一段「确保客户端/面板/lease 就绪」逻辑，这样 `qa`、
+  agent 的直连路径不必先显式 `open`；`close` 后仍保留 React body 容器，下一次 open/navigate 重挂新 lease。
+- **主题重放覆盖所有会换文档的动作**：open/navigate 之后、以及 click/key 产生导航时重放 emulate，
+  否则新 document 上的 `window.matchMedia` 覆盖会消失（反馈里最容易漏的一条）。
+- **preview 的安全边界**：`dir` 必须是绝对路径，单文件 >64 MiB 直接 413（避免 Host 把大文件整个读进内存）；
+  这些是「请求来自无人值守的 agent」时的硬约束，不是可调参数。
+
+### 34.3 验证（单测层面）
+
+- `tests/browser-control-scripts.test.mjs`：emulate shim 在假 document 上真实改写/恢复媒体规则、
+  matchMedia 覆盖与 auto 还原；metrics/wait/setContent 用假页面对象断言输出结构；纯函数行为断言。
+- `tests/browser-control-client.test.mjs`：新增命令的 controller 分派、回执、状态串联
+  （viewport 尺寸/缩放、console 计数、全页截图拉高-恢复、close 后 open 重挂载、navigate 自动开面板、
+  click 导航重放主题等）。
+- `tests/browser-control-host.test.mjs`：新 action 的 JSON Schema/参数校验/回执文本/fake client
+  往返、qa 矩阵与文件落盘、preview 服务启动/复用、status 合并、PNG/JPEG 尺寸解析与 16KB 截断。
+- `tests/preview.test.mjs`：token、穿越（含编码/反斜杠）、MIME、HEAD/405、无目录列表、file 选项、
+  超大文件 413、dispose 关闭。
+- 全套 **99 项全绿**（基线 44 + 新增 55）。
+
+### 34.4 边界（如实记录，不做假能力）
+
+- **真 DPR / deviceScaleFactor**：renderer `<webview>` 无 `webContents.debugger`，打包版还关闭 devTools，
+  `Emulation.setDeviceMetricsOverride` 调不到；截图的物理分辨率由宿主显示器缩放决定。回执只报真实
+  `devicePixelRatio` 与真实像素尺寸；需要真 DPR 的验收走 chrome-bridge（真 CDP）。
+- **file://**：桌面壳 `will-frame-navigate` 只放行 http(s)，session `webRequest` 取消 `file:`；
+  插件不做绕过。用 `setContent`（自包含 HTML）或 `preview`（本地静态预览）替代。
+- **离屏 / CI**：插件架构是「侧栏里用户能看的 webview + Host 子进程」，没有 Electron 主进程权限；
+  `qa`+`close` 覆盖批量回归的常用需求，不承诺 CI/无头。远端子 agent 操作时 sidebar 面板必须处于
+  打开状态（本插件不是独立浏览器进程）。
+- **HTTP 状态码**：renderer 侧不可观测（无 network 事件）；`logs` 只能给 console、失败图片、
+  零 transfer 资源条目，文档不写「network status」。
+- **fullPage 的 vh 布局 caveat**：截图期间区分屏高度临时变成 scrollHeight，`100vh` 类布局会重排；
+  需要精确逐屏证据时用 viewport+scroll+clip 逐段截图。
+- **主题 best-effort**：跨域样式表不可读；与其他条件组合的媒体规则在应用时点求值（之后 resize
+  不会重算）；页面内联脚本用 `matchMedia` 能拿到模拟值，但 `forced-colors`/系统级主题不受影响。
+- **真机验证依赖重启**：client bundle 只在页面启动时从 boot graph 加载，上述 QA 能力需重启 DSH
+  Desktop 后才能在侧栏真实 webview 里复验（Host 半可单独卸载/安装）。单测不覆盖真实 Electron
+  `<webview>` 的 capturePage/缩放行为，留给重启后的人工复验。
+
