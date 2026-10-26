@@ -563,24 +563,24 @@ token 移出 WS query。
 
 0.1.24 受控复验（2026-10-24）：点击 iframe 内 `GO TO INNER TWO` 输出 `(iframe script click)` 且无 no-observable-change 提示；`contentDocument.location.href` = `/inner2.html`，title/h1 = `Inner Two`。
 
-## 34. QA 能力（2026-10-26，0.1.0 → 0.2.0）
+## 34. QA 能力（2026-10-26，0.1.0 → 0.2.1）
 
 背景见 `dsh-plugins/research/feedback-triage-2026-10-26.md` §1/§3/§5：真实工程验收（改 GitHub 主页后
 明/暗 × 桌面/手机 4 组验收）暴露了侧栏浏览器缺 viewport / evaluate / 资源等待 / 证据截图 / 批量回归，
 这些可以在「页面 JS + webview DOM API」内完成；DPR、媒体仿真、网络状态码与离屏/CI 需要 CDP 或
-Electron 主进程，**不在插件能力内，不做伪造**。
+Electron 主进程，**不在插件能力内，不做伪造**。0.2.1 是 0.2.0 真机首验后的修补（见 34.5）。
 
 ### 34.1 新增工具面
 
 | action | 实现位置 | 关键事实 |
 |---|---|---|
-| `viewport {width,height=800,reset}` | Client 设 webview 元素 CSS 尺寸 + 面板内 `transform: scale()` | guest 视口 = 元素尺寸（真实布局）；面板缩放不改变 guest 布局；回执报真实 `innerWidth/innerHeight/devicePixelRatio` |
+| `viewport {width,height=800,reset}` | Client 设 webview 元素 CSS 尺寸 + 面板内 `transform: scale()` | guest 视口 = 元素尺寸（真实布局）；面板缩放不改变 guest 布局；**轮询等待 guest 报告目标尺寸**（真实 Electron 会滞后一帧以上），回执真实 `innerWidth/innerHeight/devicePixelRatio` + `matched/settledMs`；未收敛时回执 warning 而不是假成功 |
 | `evaluate {expression}` | `executeJavaScript` 包装 | 返回 JSON；Client 侧 200KB 保护桥 1MB body 上限，Host 回执再按 16KB 截断并标注 |
 | `metrics {selectors?,includeOverflow?}` | 页面脚本 `__dshAgentMetrics` + console 计数合并 | viewport/document/内容宽/横向溢出 top20/图片/`document.fonts`/console 错误警告/选择器 rect |
 | `wait` 扩展 | 页面脚本 `__dshAgentWait` 内轮询 | selector/text/networkIdle(idleMs)/images/fonts；`ms` 既是超时也是纯等待；networkIdle 是「资源计数 + DOM 突变静默」近似 |
-| `scroll` 扩展 + `scrollIntoView` | Client 轮询滚动状态 + 页面脚本 | 回执 requested/actualDelta/scrollY/scrollHeight/innerHeight/clamped/method（wheel 失效时脚本兜底）；scrollIntoView 支持 ref/selector + block |
+| `scroll` 扩展 + `scrollIntoView` | Client 轮询滚动状态 + 页面脚本 | 回执 requested/actualDelta/scrollY/scrollHeight/innerHeight/clamped/method（wheel 失效时脚本兜底）；**sendInputEvent 的 wheel deltaY 符号与 DOM 相反，内部取负**；scrollIntoView 支持 ref/selector + block |
 | `logs {clear,filter,limit}` | mount 时监听 webview `console-message` 环形缓冲（≤200） + 页面脚本 `__dshAgentLogsProbe` | 附带失败图片/可疑资源条目；**HTTP 状态码不可见**（见 34.4） |
-| `screenshot` 扩展 | Client capturePage + Host 落盘 | fullPage 临时拉高 webview 到 scrollHeight（≤12000 CSS px，capped）；元素/区域走 `capturePage(rect)`；hideCursor 默认隐藏虚拟光标；Host 解析 PNG/JPEG 头得到实际像素尺寸；不伪造 2x |
+| `screenshot` 扩展 | Client 逐屏 capturePage + canvas 拼接（fullPage）/ `capturePage(rect)`（元素、clip）+ Host 落盘 | fullPage **不再拉高 webview**（真机会卡死 capturePage），改为滚动逐屏截图后 canvas 拼接（≤12000 CSS px，capped；fixed/sticky 可能重复）；每次 capturePage 都有超时上限，挂起不会锁死命令循环；hideCursor 默认隐藏虚拟光标；Host 解析 PNG/JPEG 头得到实际像素尺寸；不伪造 2x |
 | `emulate {colorScheme}` | 页面脚本 `__dshAgentEmulate` | matchMedia 覆盖（`prefers-color-scheme` 条件替换为 width 条件求值，支持组合/not）+ 同源 @media 规则归一化 all/not all（可恢复、递归 group rule、MutationObserver/短轮询补扫）；跨域样式表不可读；导航后自动重放（open/navigate，以及会替换文档的 click/key） |
 | `setContent {html,baseUrl}` | 页面脚本 `__dshAgentSetContent` | `document.open/write/close` 渲染自包含 HTML；baseUrl 只收 http(s) 并注入 `<base>`；≤2MB；优先 about:blank（若壳/会话拒绝则如实报 in-place） |
 | `preview {dir,file?,port?}` | Host 新文件 `lib/preview.js` | `dir` 必须是绝对路径（Host 相对路径会解析到 DSH 安装目录）；127.0.0.1 + 随机 token 路径前缀、GET/HEAD、realpath 防穿越、MIME 表、无目录列表、单文件 >64MiB 拒绝(413)、dispose 关闭；action 起/复用服务后让 client `open` 该 URL |
@@ -610,19 +610,29 @@ Electron 主进程，**不在插件能力内，不做伪造**。
   否则新 document 上的 `window.matchMedia` 覆盖会消失（反馈里最容易漏的一条）。
 - **preview 的安全边界**：`dir` 必须是绝对路径，单文件 >64 MiB 直接 413（避免 Host 把大文件整个读进内存）；
   这些是「请求来自无人值守的 agent」时的硬约束，不是可调参数。
+- **fullPage 改为滚动拼接（0.2.1）**：0.2.0 用「把 webview 元素拉高到 scrollHeight 再 capturePage」，
+  真机上 capturePage 永不 resolve、client 命令循环被锁死（只能重启恢复）。0.2.1 改为正常视口尺寸下
+  逐屏滚动截图、在 renderer canvas 拼接；不再有 vh 重排，代价是 `position:fixed/sticky` 可能在拼接图里重复。
+  每次 `capturePage()` 另加超时 race，挂起时返回错误而不是卡死面板。
+- **viewport 回执要等 guest 收敛（0.2.1）**：真机首验发现元素 resize 传到 guest `innerWidth/innerHeight`
+  比一个命令周期更慢，立刻读会拿到**上一个**尺寸。改为 50ms 轮询直到匹配（约 2s 上限），
+  未收敛时回执带 warning 与真实值，不把旧尺寸当成功。
+- **wheel 符号（0.2.1）**：Electron `sendInputEvent` 的 `mouseWheel.deltaY` 用 Chromium 约定
+  （正值向上），与 DOM 相反；真机首验 `/` 位置大 deltaY 会跳到页顶。内部取负后 `action=scroll`
+  的 `deltaY>0` 才是向下。
 
 ### 34.3 验证（单测层面）
 
 - `tests/browser-control-scripts.test.mjs`：emulate shim 在假 document 上真实改写/恢复媒体规则、
   matchMedia 覆盖与 auto 还原；metrics/wait/setContent 用假页面对象断言输出结构；纯函数行为断言。
 - `tests/browser-control-client.test.mjs`：新增命令的 controller 分派、回执、状态串联
-  （viewport 尺寸/缩放、console 计数、全页截图拉高-恢复、close 后 open 重挂载、navigate 自动开面板、
-  click 导航重放主题等）。
+  （viewport 尺寸/缩放/settle 与未收敛 warning、console 计数、fullPage 逐屏拼接/恢复滚动、
+  capturePage 超时后仍能继续服务、close 后 open 重挂载、navigate 自动开面板、click 导航重放主题等）。
 - `tests/browser-control-host.test.mjs`：新 action 的 JSON Schema/参数校验/回执文本/fake client
   往返、qa 矩阵与文件落盘、preview 服务启动/复用、status 合并、PNG/JPEG 尺寸解析与 16KB 截断。
 - `tests/preview.test.mjs`：token、穿越（含编码/反斜杠）、MIME、HEAD/405、无目录列表、file 选项、
   超大文件 413、dispose 关闭。
-- 全套 **99 项全绿**（基线 44 + 新增 55）。
+- 全套 **101 项全绿**（基线 44 + 新增 57）。
 
 ### 34.4 边界（如实记录，不做假能力）
 
@@ -636,11 +646,30 @@ Electron 主进程，**不在插件能力内，不做伪造**。
   打开状态（本插件不是独立浏览器进程）。
 - **HTTP 状态码**：renderer 侧不可观测（无 network 事件）；`logs` 只能给 console、失败图片、
   零 transfer 资源条目，文档不写「network status」。
-- **fullPage 的 vh 布局 caveat**：截图期间区分屏高度临时变成 scrollHeight，`100vh` 类布局会重排；
-  需要精确逐屏证据时用 viewport+scroll+clip 逐段截图。
+- **fullPage 的拼接 caveat**：逐屏拼接不再有 vh 重排，但 `position:fixed/sticky` 元素可能在每屏重复出现；
+  需要精确证据时用 viewport+scroll+clip 逐段截图。超大页面 cap 在 12000 CSS px。
 - **主题 best-effort**：跨域样式表不可读；与其他条件组合的媒体规则在应用时点求值（之后 resize
   不会重算）；页面内联脚本用 `matchMedia` 能拿到模拟值，但 `forced-colors`/系统级主题不受影响。
 - **真机验证依赖重启**：client bundle 只在页面启动时从 boot graph 加载，上述 QA 能力需重启 DSH
   Desktop 后才能在侧栏真实 webview 里复验（Host 半可单独卸载/安装）。单测不覆盖真实 Electron
-  `<webview>` 的 capturePage/缩放行为，留给重启后的人工复验。
+  `<webview>` 的 capturePage/缩放行为，留给重启后的人工/agent 复验。
+
+### 34.5 真机首验记录（2026-10-26，0.2.0 → 0.2.1）
+
+profile 重装 + 重启 DSH 后，用真实侧栏 webview 跑首轮冒烟（example.com + setContent 主题样例），
+发现并修复三个只有真机才暴露的问题：
+
+1. **viewport 回执滞后**：`viewport {width:390,height:844}` 首次回执仍报 575x742（面板原尺寸），
+   下一次命令才看到 390x844 —— 元素 resize 传播到 guest 比一个命令周期慢。改为轮询 settle + warning。
+2. **fullPage 卡死**：0.2.0 的「拉高 webview 再 capturePage」让 capturePage 永不 resolve，bridge
+   25s 超时后 client 命令循环仍卡在 await，后续命令全部超时。0.2.1 改为逐屏拼接 + capturePage 超时。
+3. **wheel 方向反了**：`action=scroll deltaY:1000` 从 scrollY 200 直接跳到 0；Electron wheel 的
+   deltaY 正值向上，与 DOM 相反。内部取负修复。
+
+同轮已真机确认正常的能力：`open`/`navigate`、`setContent`（about:blank 上下文 + 主题重放）、
+`emulate`（computed style 与 matchMedia 都翻转，样式表 media rule 被改写/恢复）、`evaluate`、
+`metrics`、`logs`（console error 被缓冲读出）、`scroll` 脚本兜底、`scrollIntoView`、
+`viewport` 的真实布局（metrics 显示 300x600、body 宽 285 = 滚动条扣除）、`close`。
+仍待下一轮重启后复验：fullPage 拼接截图、元素/clip 截图、`qa` 矩阵、`preview` 本地目录、
+以及 client 循环在 capturePage 超时后继续服务的真机行为。
 

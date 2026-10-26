@@ -68,7 +68,7 @@ const CLIENT_FRESH_MS = 60_000;
 const DESCRIPTION =
   "Drive the Agent Browser in the DSH sidebar: a real Chromium webview that the user can watch, with a visible agent cursor that never moves the user's mouse. " +
   "Workflow: action=open with a URL, then action=snapshot to read the page (visible interactive elements get refs), then action=click/type by ref; call snapshot again after each action that changes the page. Refs are only valid for the most recent snapshot. " +
-  "QA actions: viewport {width,height,reset} sets the real CSS viewport (the panel scales to fit), evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence, emulate {colorScheme} applies a best-effort light/dark preference, setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state. " +
+  "QA actions: viewport {width,height,reset} sets the real CSS viewport (the panel scales to fit) and waits for the guest to report it, evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence (fullPage scroll-stitches viewport captures; fixed/sticky elements may repeat), emulate {colorScheme} applies a best-effort light/dark preference, setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state. " +
   "Boundaries: only http(s) navigation — file:// is blocked by the desktop shell (use setContent or preview); deviceScaleFactor/DPR cannot be emulated (no CDP from a renderer <webview>) and screenshots report their real pixel size instead; emulate is best-effort (matchMedia shim + same-origin media-rule rewrite; cross-origin stylesheets cannot be patched); there is no offscreen/CI mode — qa runs in the visible panel. Screenshots save to disk; call read_image with the returned path. Coordinates are CSS pixels inside the page viewport.";
 
 function requireHttpUrl(raw, field) {
@@ -657,13 +657,19 @@ function formatResult(action, value) {
     case "viewport": {
       const actual = value.actual ?? {};
       const dpr = actual.devicePixelRatio ?? value.devicePixelRatio ?? "?";
+      const warning =
+        value.matched === false
+          ? ` — warning: the guest viewport did not settle to the requested size within ${value.settledMs ?? "?"}ms (actual ${actual.innerWidth ?? "?"}x${actual.innerHeight ?? "?"})`
+          : "";
       if (value.reset === true) {
-        return `viewport reset to panel size: ${actual.innerWidth ?? value.width ?? "?"}x${actual.innerHeight ?? value.height ?? "?"} (devicePixelRatio ${dpr})`;
+        return `viewport reset to panel size: ${actual.innerWidth ?? value.width ?? "?"}x${actual.innerHeight ?? value.height ?? "?"} (devicePixelRatio ${dpr})${warning}`;
       }
       return (
         `viewport: ${value.width}x${value.height} requested; actual ${actual.innerWidth ?? "?"}x${actual.innerHeight ?? "?"}` +
         ` (devicePixelRatio ${dpr})` +
         (Number.isFinite(Number(value.scale)) ? `; panel scale ${Number(value.scale).toFixed(3)}` : "") +
+        `; settled in ${value.settledMs ?? "?"}ms` +
+        warning +
         " — deviceScaleFactor is not emulated (no CDP); screenshots report real pixels"
       );
     }
@@ -922,8 +928,11 @@ export function apply(ctx) {
     if (value.fullPage !== undefined) {
       const fullPage = value.fullPage ?? {};
       notes.push(
-        `full page: captured ${fullPage.capturedHeight ?? "?"} of ${fullPage.requestedHeight ?? "?"} CSS px` +
-          (fullPage.capped === true ? " (capped at 12000; scroll and capture again for the rest)" : ""),
+        `full page: ${fullPage.stitched === true ? `stitched ${fullPage.segments ?? "?"} viewport capture(s), ` : ""}captured ${
+          fullPage.capturedHeight ?? "?"
+        } of ${fullPage.requestedHeight ?? "?"} CSS px` +
+          (fullPage.capped === true ? " (capped at 12000; scroll and capture again for the rest)" : "") +
+          (fullPage.stitched === true ? "; position:fixed/sticky elements may repeat in the stitched image" : ""),
       );
     }
     if (value.mode === "element") notes.push("element capture");

@@ -60,7 +60,7 @@ inside the page viewport.
 | `evaluate` | `expression` | `executeJavaScript` wrapper; JSON result, Host receipt capped at 16KB |
 | `metrics` | `selectors[]`, `includeOverflow` | viewport/document sizes, content width, top-20 horizontal overflow, images (total/loaded/failed + src), `document.fonts.status`, console error/warning counts, per-selector rect/natural size |
 | `logs` | `clear`, `filter`, `limit` | console-message ring buffer (≤200) + page-side failed-image/resource probe |
-| `screenshot` | `fullPage`, `clip{x,y,width,height}`, `ref`, `selector`, `format` (`png`/`jpeg`), `quality`, `path`, `hideCursor` | saves PNG/JPEG evidence and reports the real pixel size parsed from the file |
+| `screenshot` | `fullPage`, `clip{x,y,width,height}`, `ref`, `selector`, `format` (`png`/`jpeg`), `quality`, `path`, `hideCursor` | saves PNG/JPEG evidence and reports the real pixel size parsed from the file; `fullPage` scroll-stitches viewport captures (≤12000 CSS px; fixed/sticky elements may repeat) |
 | `emulate` | `colorScheme` (`light`/`dark`/`auto`) | best-effort light/dark preference: matchMedia shim + same-origin `@media (prefers-color-scheme)` rewrite; replayed on navigation (open/navigate/click/key) |
 | `setContent` | `html`, optional `baseUrl` | render self-contained HTML (inline CSS / `data:` URLs; max 2MB) |
 | `preview` | `dir` (absolute), optional `file`, `port` | serve a local directory over a tokenized 127.0.0.1 URL and open it |
@@ -96,11 +96,15 @@ browser close
   directory (see below).
 - **No offscreen / CI mode.** `qa` runs inside the visible sidebar panel; the
   plugin has no Electron main-process access and cannot render headless.
-- **`fullPage` screenshot caveat.** It temporarily grows the webview element to
-  `scrollHeight` (max 12000 CSS px, then reported as `capped`) and captures, then
-  restores. `vh`-sized layouts reflow while the guest is stretched, so a
-  full-page capture of a `100vh` hero is not identical to one viewport-by-viewport
-  capture; scroll and capture regions if exact composition matters.
+- **`fullPage` screenshot is scroll-stitched, not a guest resize.** On the first
+  real-device run (2026-10-26) the earlier "grow the webview element then
+  `capturePage()`" approach hung `capturePage()` forever and wedged the command
+  loop until DSH restarted. The current implementation scrolls one viewport at a
+  time, captures normal-size frames, and stitches them in a canvas (cap 12000
+  CSS px, reported as `capped`). `vh` layouts are no longer distorted, but
+  `position:fixed/sticky` elements can repeat in the stitched image. Every
+  `capturePage()` call is also bounded by a timeout, so a hanging capture returns
+  an error instead of freezing the panel.
 - **Theme `emulate` is best-effort, not CDP emulation.** It overrides
   `matchMedia('(prefers-color-scheme: …)')` in the page and rewrites same-origin
   media rules to `all`/`not all`. Cross-origin stylesheets are unreadable by
@@ -116,7 +120,15 @@ browser close
 - **`wait networkIdle` is an approximation**: quiet resource-entry count + DOM
   mutations for `idleMs`, not real network idle.
 - **`viewport` is a real CSS viewport, displayed scaled** down inside the panel;
-  the panel scale never changes the guest's layout size.
+  the panel scale never changes the guest's layout size. A real Electron `<webview>`
+  can take more than one frame to propagate the element resize into the guest's
+  `innerWidth/innerHeight`, so the action polls until the guest reports the
+  requested size (or warns after ~2s) instead of reporting the previous size.
+- **`scroll` sends a negated wheel delta internally.** Electron's synthesized
+  `mouseWheel` `deltaY` follows the Chromium convention (positive scrolls up),
+  opposite to the DOM: the action negates it so `deltaY` positive scrolls down;
+  if the synthetic wheel is ignored the scripted fallback runs and the receipt
+  says `[script fallback]`.
 
 ## Local preview (`preview`)
 
@@ -155,7 +167,7 @@ npm test
 `tests/browser-control-client.test.mjs` executes this real `client.js` in a Node
 VM with mocked `__ModuleLoader__` / `dshDesktop` / `<webview>` and checks the
 boot contract (`apply()` must return `undefined`), tab registration and every
-controller command (including the 0.2.0 QA commands).
+controller command (including the 0.2.x QA commands).
 `tests/browser-control-scripts.test.mjs` executes the generated page scripts
 (theme shim, metrics, wait, setContent) against fake page globals, so the logic
 is asserted behaviourally, not just by string. `tests/browser-control-host.test.mjs`

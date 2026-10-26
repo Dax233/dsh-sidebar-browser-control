@@ -204,7 +204,9 @@ function startFakeClient(port, received, isStopped) {
           format: "png",
           mode: command.fullPage === true ? "fullPage" : "viewport",
           devicePixelRatio: 1,
-          ...(command.fullPage === true ? { fullPage: { requestedHeight: 24000, capturedHeight: 12000, capped: true } } : {}),
+          ...(command.fullPage === true
+            ? { fullPage: { requestedHeight: 24000, capturedHeight: 12000, capped: true, segments: 17, stitched: true, viewportHeight: 742 } }
+            : {}),
         };
       case "viewport":
         return {
@@ -213,6 +215,8 @@ function startFakeClient(port, received, isStopped) {
           height: command.height,
           scale: 0.5,
           ...(command.reset === true ? { reset: true } : {}),
+          matched: true,
+          settledMs: 12,
           actual: { innerWidth: command.width ?? 575, innerHeight: command.height ?? 742, devicePixelRatio: 1 },
         };
       case "evaluate":
@@ -519,8 +523,19 @@ test("0.2.0 host helpers: parseImageSize reads PNG/JPEG headers and truncateJson
 test("0.2.0 host receipts: new actions format compact, actionable text", () => {
   const { formatResult: format } = plugin.__test;
   assert.match(
-    format("viewport", { width: 1280, height: 800, scale: 0.375, actual: { innerWidth: 1280, innerHeight: 800, devicePixelRatio: 1 } }),
-    /viewport: 1280x800 requested; actual 1280x800 \(devicePixelRatio 1\); panel scale 0\.375/,
+    format("viewport", { width: 1280, height: 800, scale: 0.375, matched: true, settledMs: 80, actual: { innerWidth: 1280, innerHeight: 800, devicePixelRatio: 1 } }),
+    /viewport: 1280x800 requested; actual 1280x800 \(devicePixelRatio 1\); panel scale 0\.375; settled in 80ms/,
+  );
+  assert.match(
+    format("viewport", {
+      width: 390,
+      scale: 1,
+      matched: false,
+      settledMs: 2000,
+      actual: { innerWidth: 575, innerHeight: 742, devicePixelRatio: 1 },
+    }),
+    /warning: the guest viewport did not settle .*actual 575x742/,
+    "a stale guest viewport must be called out instead of reported as success",
   );
   assert.match(
     format("viewport", { reset: true, actual: { innerWidth: 575, innerHeight: 742, devicePixelRatio: 1 } }),
@@ -648,7 +663,8 @@ test("0.2.0 host screenshot: saves to an absolute path, parses real pixels, and 
       const result = await tool.execute({ action: "screenshot", fullPage: true, path: target });
       assert.match(result.text, /screenshot saved:/);
       assert.match(result.text, /320x240px/);
-      assert.match(result.text, /full page: captured 12000 of 24000 CSS px \(capped at 12000/);
+      assert.match(result.text, /full page: stitched 17 viewport capture\(s\), captured 12000 of 24000 CSS px \(capped at 12000/);
+      assert.match(result.text, /position:fixed\/sticky elements may repeat/);
       assert.equal(existsSync(target), true, "the screenshot must be written to the requested absolute path");
       assert.deepEqual(plugin.__test.parseImageSize(readFileSync(target)), { format: "png", width: 320, height: 240 });
       assert.equal(received[0].fullPage, true);

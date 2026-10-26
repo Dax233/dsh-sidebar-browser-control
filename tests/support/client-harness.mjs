@@ -144,7 +144,20 @@ export function loadClientBundle(clientFile, options = {}) {
   const document = {
     createElement: (tag) => {
       const element = makeElement(tag);
-      if (String(tag).toLowerCase() === "webview" && options.webview !== undefined) {
+      const name = String(tag).toLowerCase();
+      if (name === "canvas") {
+        // Full-page screenshot stitching draws the captured segments here.
+        element.width = 0;
+        element.height = 0;
+        element.__draws = [];
+        element.getContext = () => ({
+          drawImage(image, x, y, width, height) {
+            element.__draws.push({ x, y, width, height, naturalWidth: image?.naturalWidth, naturalHeight: image?.naturalHeight });
+          },
+        });
+        element.toDataURL = (type = "image/png") => `data:${type};base64,AAAA`;
+      }
+      if (name === "webview" && options.webview !== undefined) {
         const supplied = typeof options.webview === "function" ? options.webview(tag) : options.webview;
         if (supplied !== undefined) Object.assign(element, supplied);
       }
@@ -156,6 +169,24 @@ export function loadClientBundle(clientFile, options = {}) {
     body: makeElement("body"),
   };
 
+  /** Decoded-image stand-in for canvas stitching; tests may override dimensions. */
+  class FakeImage {
+    constructor() {
+      this.naturalWidth = options.imageNaturalWidth ?? 1280;
+      this.naturalHeight = options.imageNaturalHeight ?? 800;
+      this._src = "";
+    }
+    set src(value) {
+      this._src = String(value);
+    }
+    get src() {
+      return this._src;
+    }
+    decode() {
+      return Promise.resolve();
+    }
+  }
+
   const sandbox = {
     window: { __ModuleLoader__: { load: (definition) => registrations.push(definition) } },
     document,
@@ -165,6 +196,7 @@ export function loadClientBundle(clientFile, options = {}) {
     fetch: fetchMock,
     AbortSignal: FakeAbortSignal,
     AbortController: FakeAbortController,
+    Image: FakeImage,
     URL,
     URLSearchParams,
     setTimeout: (fn, ms) => {

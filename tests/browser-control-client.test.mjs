@@ -16,6 +16,9 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 function makeWebviewMock(options = {}) {
   const calls = { executeJavaScript: [], sendInputEvent: [], insertText: [], loadURL: [], focus: 0, getURL: 0 };
   let scrollY = options.statefulScroll === true ? 0 : 120;
+  // trackingScroll emulates a real scroll container for fullPage stitching:
+  // window.scrollTo() moves the reported position (clamped to the page).
+  let pageScroll = 120;
   const webview = {
     style: {},
     ...(options.capturePage !== undefined ? { capturePage: options.capturePage } : {}),
@@ -45,9 +48,14 @@ function makeWebviewMock(options = {}) {
         };
       }
       if (code.includes("__dshAgentViewportInfo")) {
+        // A fixed viewport is expressed as px on the element; "100%" means auto.
+        const widthText = String(webview.style.width ?? "");
+        const heightText = String(webview.style.height ?? "");
+        const styleWidth = options.ignoreViewportStyle === true ? Number.NaN : widthText.endsWith("px") ? Number.parseFloat(widthText) : Number.NaN;
+        const styleHeight = options.ignoreViewportStyle === true ? Number.NaN : heightText.endsWith("px") ? Number.parseFloat(heightText) : Number.NaN;
         return {
-          innerWidth: options.viewportWidth ?? 1280,
-          innerHeight: options.viewportHeight ?? 800,
+          innerWidth: Number.isFinite(styleWidth) ? Math.round(styleWidth) : options.viewportWidth ?? 1280,
+          innerHeight: Number.isFinite(styleHeight) ? Math.round(styleHeight) : options.viewportHeight ?? 800,
           devicePixelRatio: options.devicePixelRatio ?? 1,
           scrollWidth: options.viewportWidth ?? 1280,
           scrollHeight: 2400,
@@ -126,8 +134,15 @@ function makeWebviewMock(options = {}) {
         if (match) scrollY += Number(match[1]);
         return { scrolled: true };
       }
+      if (options.trackingScroll === true && code.includes("window.scrollTo(0,")) {
+        const match = /window\.scrollTo\(0,\s*(-?\d+(?:\.\d+)?)\)/.exec(code);
+        if (match) pageScroll = Math.max(0, Math.min(Number(match[1]), 900 - 742));
+        return 1;
+      }
       if (code.includes("__dshAgentScrollState")) {
-        return { scrollY: options.statefulScroll === true ? scrollY : 120, scrollHeight: 900, innerHeight: 742 };
+        return options.trackingScroll === true
+          ? { scrollY: pageScroll, scrollHeight: 900, innerHeight: 742 }
+          : { scrollY: options.statefulScroll === true ? scrollY : 120, scrollHeight: 900, innerHeight: 742 };
       }
       if (code.includes("__dshAgentFocusedValue")) return { value: "deepseek harness" };
       if (code.includes("__dshAgentFocus")) return { ok: true };
@@ -196,6 +211,8 @@ function makeController(options = {}) {  const loaded = loadClientBundle(clientF
     ...(options.consoleLimit !== undefined ? { consoleLimit: options.consoleLimit } : {}),
     ...(options.evaluateResultLimit !== undefined ? { evaluateResultLimit: options.evaluateResultLimit } : {}),
     ...(options.fullPageMaxCssPx !== undefined ? { fullPageMaxCssPx: options.fullPageMaxCssPx } : {}),
+    ...(options.captureTimeoutMs !== undefined ? { captureTimeoutMs: options.captureTimeoutMs } : {}),
+    ...(options.viewportSettleMs !== undefined ? { viewportSettleMs: options.viewportSettleMs } : {}),
     ensurePanel: () => {
       ensurePanelCalls += 1;
       return undefined;
@@ -456,7 +473,9 @@ test("key and scroll dispatch the expected input events", async () => {
     "Enter must fall back to form.requestSubmit when no navigation happened",
   );
   const wheel = calls.sendInputEvent.find((event) => event.type === "mouseWheel");
-  assert.equal(wheel.deltaY, 420);
+  // Electron's wheel event is inverted relative to the DOM WheelEvent convention:
+  // a downward scroll must be sent as a negative deltaY.
+  assert.equal(wheel.deltaY, -420, "positive action deltaY must be negated on the Electron wheel event");
   controller.unmount();
 });
 
@@ -610,7 +629,13 @@ test("type refuses to report success when the focus is not editable", async () =
 // ---------------------------------------------------------------------------
 
 test("viewport resizes the guest element to the requested CSS size, reports real numbers, and reset restores auto", async () => {
-  const mounted = await mountController({ panelWidth: 480, panelHeight: 700 });
+  const mounted = await mountController({
+    panelWidth: 480,
+    panelHeight: 700,
+    controllerOptions: { viewportSettleMs: 200 },
+    // Auto layout reports the panel size; a fixed viewport reports its own px.
+    webviewOptions: { viewportWidth: 480, viewportHeight: 700 },
+  });
   const { controller, mock } = mounted;
   const result = await controller.handle({ type: "viewport", width: 1280, height: 800 });
   assert.equal(result.ok, true);
@@ -619,6 +644,8 @@ test("viewport resizes the guest element to the requested CSS size, reports real
   assert.equal(result.actual.innerWidth, 1280, "the receipt reports the real guest innerWidth, not the request");
   assert.equal(result.actual.innerHeight, 800);
   assert.equal(result.actual.devicePixelRatio, 1);
+  assert.equal(result.matched, true, "the command must wait until the guest reports the requested viewport");
+  assert.equal(typeof result.settledMs, "number");
   assert.equal(mock.webview.style.width, "1280px");
   assert.equal(mock.webview.style.height, "800px");
   assert.equal(result.scale, 0.375, "480x700 panel shows a 1280x800 guest at 0.375 scale");
@@ -629,11 +656,24 @@ test("viewport resizes the guest element to the requested CSS size, reports real
   const reset = await controller.handle({ type: "viewport", reset: true });
   assert.equal(reset.ok, true);
   assert.equal(reset.reset, true);
+  assert.equal(reset.matched, true);
   assert.equal(mock.webview.style.width, "100%");
   assert.equal(mock.webview.style.height, "100%");
   assert.equal(mock.webview.style.transform, "");
   assert.deepEqual(plain(controller.status().viewport), { auto: true });
   controller.unmount();
+});
+
+test("viewport reports a warning instead of a fake size when the guest never settles", async () => {
+  const mounted = await mountController({
+    controllerOptions: { viewportSettleMs: 80 },
+    webviewOptions: { viewportWidth: 999, viewportHeight: 888, ignoreViewportStyle: true },
+  });
+  const result = await mounted.controller.handle({ type: "viewport", width: 1280, height: 800 });
+  assert.equal(result.matched, false);
+  assert.equal(result.actual.innerWidth, 999, "the receipt reports what the guest actually says");
+  assert.equal(result.actual.innerHeight, 888);
+  mounted.controller.unmount();
 });
 
 test("evaluate returns the page JSON value and cap-truncates a huge result", async () => {
@@ -816,12 +856,13 @@ test("screenshot hides the agent cursor, honours element/clip rects, and restore
   mounted.controller.unmount();
 });
 
-test("screenshot fullPage grows the webview to scrollHeight (capped) then restores it", async () => {
+test("screenshot fullPage stitches viewport captures without resizing the guest", async () => {
   const captured = [];
   let mounted;
   mounted = await mountController({
     controllerOptions: { fullPageMaxCssPx: 1200 },
     webviewOptions: {
+      trackingScroll: true,
       capturePage: async () => {
         captured.push({ height: mounted.mock.webview.style.height, flex: mounted.mock.webview.style.flex });
         return { toDataURL: () => "data:image/png;base64,AAAA" };
@@ -830,23 +871,49 @@ test("screenshot fullPage grows the webview to scrollHeight (capped) then restor
   });
   const result = await mounted.controller.handle({ type: "screenshot", fullPage: true });
   assert.equal(result.ok, true);
+  assert.equal(result.mode, "fullPage");
   assert.equal(result.fullPage.requestedHeight, 900, "scrollHeight comes from the page state script");
   assert.equal(result.fullPage.capturedHeight, 900);
   assert.equal(result.fullPage.capped, false);
-  assert.equal(captured[0].height, "900px", "the guest must be tall during the capture");
-  assert.equal(mounted.mock.webview.style.height, "100%", "the original layout must be restored");
+  assert.equal(result.fullPage.stitched, true);
+  assert.equal(result.fullPage.segments, 2, "900 CSS px at a 742 px viewport needs two slices");
+  assert.equal(captured.length, 2, "one normal-size capturePage per viewport slice");
+  assert.equal(captured[0].height, undefined, "the guest must not be resized for fullPage");
+  const canvas = mounted.loaded.elements.find((element) => Array.isArray(element.__draws) && element.__draws.length > 0);
+  assert.ok(canvas, "the stitched image must be drawn into a canvas");
+  assert.equal(canvas.height, 900);
+  assert.deepEqual(plain(canvas.__draws.map((draw) => draw.y)), [0, 158], "the last slice draws at the clamped bottom scroll");
+  const scrollToCalls = mounted.calls.executeJavaScript.filter((code) => code.includes("window.scrollTo"));
+  assert.ok(scrollToCalls.length >= 3);
+  assert.match(scrollToCalls.at(-1), /scrollTo\(0, 120\)/, "the original scroll position must be restored");
   mounted.controller.unmount();
 
   const capped = await mountController({
     controllerOptions: { fullPageMaxCssPx: 500 },
     webviewOptions: {
+      trackingScroll: true,
       capturePage: async () => ({ toDataURL: () => "data:image/png;base64,AAAA" }),
     },
   });
   const tallShot = await capped.controller.handle({ type: "screenshot", fullPage: true });
   assert.equal(tallShot.fullPage.capturedHeight, 500);
   assert.equal(tallShot.fullPage.capped, true);
+  assert.equal(tallShot.fullPage.segments, 1);
   capped.controller.unmount();
+});
+
+test("a hanging capturePage times out instead of wedging the command loop", async () => {
+  const mounted = await mountController({
+    controllerOptions: { captureTimeoutMs: 40 },
+    webviewOptions: { capturePage: () => new Promise(() => {}) },
+  });
+  const shot = mounted.controller.handle({ type: "screenshot" });
+  await flushMicrotasks();
+  mounted.loaded.flushTimers();
+  await assert.rejects(() => shot, /capturePage timed out/);
+  const snapshot = await mounted.controller.handle({ type: "snapshot" });
+  assert.equal(snapshot.ok, true, "commands must still be served after a capture timeout");
+  mounted.controller.unmount();
 });
 
 test("screenshot format=jpeg uses toJPEG quality and rejects a bad target", async () => {

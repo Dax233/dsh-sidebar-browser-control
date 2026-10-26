@@ -973,6 +973,8 @@ window.__ModuleLoader__.load({
       const consoleLimit = options.consoleLimit ?? 200;
       const evaluateResultLimit = options.evaluateResultLimit ?? 200 * 1024;
       const fullPageMaxCssPx = options.fullPageMaxCssPx ?? 12000;
+      const captureTimeoutMs = options.captureTimeoutMs ?? 12000;
+      const viewportSettleMs = options.viewportSettleMs ?? 2000;
 
       let webview;
       let lease;
@@ -1325,6 +1327,129 @@ window.__ModuleLoader__.load({
         };
       }
 
+      /**
+       * Wait until the guest reports the expected viewport. A real Electron
+       * <webview> can take more than one command turn to propagate an element
+       * resize into the guest's innerWidth/innerHeight, so reading once right
+       * after the style write would report the *previous* size (observed on a
+       * real DSH Desktop; see docs §34.5).
+       *
+       * @returns {{actual: object, matched: boolean, settledMs: number}}
+       */
+      async function settleViewport(current, expected, timeoutMs = viewportSettleMs) {
+        const started = Date.now();
+        for (;;) {
+          const actual = await readViewportInfo(current);
+          const matched =
+            expected === undefined ||
+            (Math.abs(actual.innerWidth - expected.width) <= 2 && Math.abs(actual.innerHeight - expected.height) <= 2);
+          const settledMs = Date.now() - started;
+          if (matched === true || settledMs >= timeoutMs) return { actual, matched, settledMs };
+          await sleepImpl(50);
+        }
+      }
+
+      /** Reject a hanging Electron API after timeoutMs so the command loop survives. */
+      function withCaptureTimeout(promise, timeoutMs, label) {
+        let timer;
+        const timeout = new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+        });
+        return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+      }
+
+      /** Draw stitched viewport captures into one canvas and encode it. */
+      async function stitchSegments(segments, width, height, viewportHeight, format, quality) {
+        const canvas = documentRef.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(width));
+        canvas.height = Math.max(1, Math.round(height));
+        const context = typeof canvas.getContext === "function" ? canvas.getContext("2d") : undefined;
+        if (!context || typeof context.drawImage !== "function") {
+          throw new Error("fullPage screenshot needs a 2D canvas in the renderer");
+        }
+        const ImageCtor = globalThis.Image;
+        if (typeof ImageCtor !== "function") throw new Error("fullPage screenshot needs the renderer Image constructor");
+        for (const segment of segments) {
+          const image = new ImageCtor();
+          image.src = segment.dataUrl;
+          if (typeof image.decode === "function") await image.decode();
+          else {
+            await new Promise((resolve, reject) => {
+              image.onload = resolve;
+              image.onerror = () => reject(new Error("a fullPage capture segment could not be decoded"));
+            });
+          }
+          context.drawImage(image, 0, segment.actualY, Math.round(width), Math.round(viewportHeight));
+        }
+        const dataUrl =
+          format === "jpeg"
+            ? canvas.toDataURL("image/jpeg", Math.max(1, Math.min(100, Number(quality ?? 80))) / 100)
+            : canvas.toDataURL("image/png");
+        if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
+          throw new Error("fullPage stitching produced no image (the page may be too large for a canvas)");
+        }
+        return dataUrl;
+      }
+
+      /**
+       * Full-page evidence without resizing the guest.
+       *
+       * The earlier approach (grow the webview element to scrollHeight, then
+       * capturePage) hung in a real DSH Desktop session: capturePage never
+       * settled and the client command loop stayed stuck until restart. This
+       * implementation scrolls viewport by viewport, captures normal-sized
+       * frames, and stitches them in a canvas: no guest resize, no vh reflow.
+       * Cost: position:fixed/sticky elements repeat in the output (documented).
+       */
+      async function captureFullPage(current, options = {}) {
+        if (typeof current.capturePage !== "function") throw new Error("capturePage is not available in this webview");
+        const format = options.format === "jpeg" ? "jpeg" : "png";
+        const quality = options.quality;
+        const state = await current.executeJavaScript(scrollStateJs());
+        const viewport = await current.executeJavaScript(viewportInfoJs());
+        const requestedHeight = Math.max(1, Math.round(Number(state?.scrollHeight ?? 0)));
+        const viewportHeight = Math.max(1, Math.round(Number(state?.innerHeight ?? viewport?.innerHeight ?? 0)));
+        const viewportWidth = Math.max(1, Math.round(Number(viewport?.innerWidth ?? 0)));
+        const originalScrollY = Math.max(0, Math.round(Number(state?.scrollY ?? 0)));
+        const capturedHeight = Math.max(1, Math.min(requestedHeight, fullPageMaxCssPx));
+        const segments = [];
+        let targetY = 0;
+        try {
+          while (targetY < capturedHeight) {
+            await current.executeJavaScript(`(() => { window.scrollTo(0, ${targetY}); return 1; })()`);
+            await sleepImpl(60);
+            const image = await withCaptureTimeout(Promise.resolve(current.capturePage()), captureTimeoutMs, "capturePage");
+            // The browser clamps a scroll near the bottom; record where the
+            // frame really starts so the stitched output stays aligned.
+            const at = await current.executeJavaScript(scrollStateJs());
+            const actualY = Math.max(0, Math.round(Number(at?.scrollY ?? targetY)));
+            segments.push({ actualY, dataUrl: imageToDataUrl(image, "png", 100) });
+            if (actualY >= capturedHeight - viewportHeight) break;
+            targetY += viewportHeight;
+          }
+        } finally {
+          try {
+            await current.executeJavaScript(`(() => { window.scrollTo(0, ${originalScrollY}); return 1; })()`);
+          } catch {
+            // The page may have navigated away mid-capture.
+          }
+        }
+        const dataUrl = await stitchSegments(segments, viewportWidth, capturedHeight, viewportHeight, format, quality);
+        return {
+          dataUrl,
+          format,
+          fullPage: {
+            requestedHeight,
+            capturedHeight,
+            capped: requestedHeight > capturedHeight,
+            segments: segments.length,
+            stitched: true,
+            viewportHeight,
+          },
+          viewportInfo: { innerWidth: viewportWidth, innerHeight: viewportHeight },
+        };
+      }
+
       /** Replay the best-effort theme shim after a page context was replaced. */
       async function replayTheme(current) {
         if (themeState === "auto") return false;
@@ -1564,7 +1689,12 @@ window.__ModuleLoader__.load({
             }
             const before = await current.executeJavaScript(scrollStateJs());
             const beforeScrollY = typeof before?.scrollY === "number" ? before.scrollY : undefined;
-            current.sendInputEvent({ type: "mouseWheel", x, y, deltaX: 0, deltaY: requestedDelta, canScroll: true });
+            // Electron's synthesized wheel uses the Chromium WebMouseWheelEvent
+            // sign convention (positive deltaY scrolls UP), the opposite of the
+            // DOM WheelEvent convention used by our deltaY argument. Negating
+            // here is what makes action=scroll deltaY positive scroll downward;
+            // without it a large deltaY from a scrolled position jumps to the top.
+            current.sendInputEvent({ type: "mouseWheel", x, y, deltaX: 0, deltaY: -requestedDelta, canScroll: true });
             await sleepImpl(140);
             let state = await current.executeJavaScript(scrollStateJs());
             let method = "wheel";
@@ -1683,9 +1813,8 @@ window.__ModuleLoader__.load({
             if (command.reset === true) {
               viewportState = undefined;
               applyViewportStyle(undefined);
-              await sleepImpl(120);
-              const actual = await readViewportInfo(current);
-              return { ok: true, reset: true, width: actual.innerWidth, height: actual.innerHeight, actual };
+              const settled = await settleViewport(current, panelSize());
+              return { ok: true, reset: true, width: settled.actual.innerWidth, height: settled.actual.innerHeight, actual: settled.actual, matched: settled.matched, settledMs: settled.settledMs };
             }
             const width = Math.max(64, Math.min(10000, Math.round(Number(command.width))));
             const height = Math.max(64, Math.min(10000, Math.round(Number(command.height ?? 800))));
@@ -1693,9 +1822,8 @@ window.__ModuleLoader__.load({
             const scale = computeScale(width, height);
             viewportState = { width, height, scale };
             applyViewportStyle(viewportState);
-            await sleepImpl(150);
-            const actual = await readViewportInfo(current);
-            return { ok: true, width, height, scale, actual, panel: panelSize() };
+            const settled = await settleViewport(current, { width, height });
+            return { ok: true, width, height, scale, actual: settled.actual, matched: settled.matched, settledMs: settled.settledMs, panel: panelSize() };
           }
           case "logs": {
             const current = await requireReady();
@@ -1799,7 +1927,6 @@ window.__ModuleLoader__.load({
             let mode = "viewport";
             let elementInfo;
             let clipInfo;
-            let fullPageInfo;
             let viewportInfo;
             if (command.ref !== undefined || command.selector !== undefined) {
               const target = await current.executeJavaScript(
@@ -1825,7 +1952,6 @@ window.__ModuleLoader__.load({
               mode = "fullPage";
             }
             let cursorHidden = false;
-            let previousHeight;
             try {
               if (hideCursor) {
                 try {
@@ -1836,22 +1962,31 @@ window.__ModuleLoader__.load({
                 }
               }
               if (mode === "fullPage") {
-                const state = await current.executeJavaScript(scrollStateJs());
-                const requestedHeight = Math.max(1, Number(state?.scrollHeight ?? 0));
-                const capturedHeight = Math.max(1, Math.min(requestedHeight, fullPageMaxCssPx));
-                const element = webview;
-                previousHeight = element === undefined ? undefined : String(element.style.height ?? "");
-                if (element !== undefined) {
-                  // Temporarily grow the guest viewport so one capture covers the
-                  // whole page. vh-based layouts reflow during the capture (see docs).
-                  element.style.height = `${capturedHeight}px`;
-                  element.style.flex = "0 0 auto";
-                }
-                fullPageInfo = { requestedHeight, capturedHeight, capped: requestedHeight > fullPageMaxCssPx };
-                await sleepImpl(180);
+                // Scroll-stitch instead of resizing the guest: growing a real
+                // Electron <webview> element and then calling capturePage hung
+                // in a real session (capturePage never settled and wedged the
+                // command loop), so full-page evidence must not resize.
+                const stitched = await captureFullPage(current, { format, quality });
+                return {
+                  ok: true,
+                  dataUrl: stitched.dataUrl,
+                  format,
+                  mode,
+                  fullPage: stitched.fullPage,
+                  viewport: {
+                    width: stitched.viewportInfo.innerWidth,
+                    height: stitched.viewportInfo.innerHeight,
+                  },
+                  devicePixelRatio: undefined,
+                  hideCursor,
+                };
               }
               if (typeof current.capturePage !== "function") throw new Error("capturePage is not available in this webview");
-              const image = rect === undefined ? await current.capturePage() : await current.capturePage(rect);
+              const image = await withCaptureTimeout(
+                rect === undefined ? Promise.resolve(current.capturePage()) : Promise.resolve(current.capturePage(rect)),
+                captureTimeoutMs,
+                "capturePage",
+              );
               const dataUrl = imageToDataUrl(image, format, quality);
               if (viewportInfo === undefined || viewportInfo === null) {
                 try {
@@ -1870,7 +2005,6 @@ window.__ModuleLoader__.load({
                 height: rect?.height,
                 clip: clipInfo,
                 element: elementInfo,
-                fullPage: fullPageInfo,
                 viewport:
                   viewportInfo === undefined
                     ? undefined
@@ -1879,16 +2013,6 @@ window.__ModuleLoader__.load({
                 hideCursor,
               };
             } finally {
-              if (mode === "fullPage") {
-                const element = webview;
-                if (element !== undefined) {
-                  element.style.height = previousHeight !== undefined && previousHeight !== "" ? previousHeight : "100%";
-                  // Keep the fixed-viewport flex basis; only auto layout returns
-                  // to the panel-sized flex default.
-                  element.style.flex = viewportState === undefined ? "" : "0 0 auto";
-                }
-                await sleepImpl(80);
-              }
               if (cursorHidden) {
                 try {
                   await current.executeJavaScript(cursorVisibilityJs(false));
