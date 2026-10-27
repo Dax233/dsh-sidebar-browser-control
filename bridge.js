@@ -41,11 +41,17 @@ function tokenEquals(provided, expected) {
  * @param {number} [options.pollTimeoutMs] how long one /poll may stay open.
  * @param {number} [options.commandTimeoutMs] how long a command may wait for its result.
  * @param {string[]} [options.allowedOrigins] browser origins allowed to call the bridge.
+ * @param {number} [options.maxResultBodyBytes] max size of one /result JSON body.
  * @param {(message: string) => void} [options.log]
  */
 export function createBridge(options) {
   const pollTimeoutMs = options.pollTimeoutMs ?? 20000;
   const commandTimeoutMs = options.commandTimeoutMs ?? 10000;
+  // A full-page PNG of a real site is easily several MB once base64-encoded;
+  // the old 1 MB cap silently rejected those results, so the Host only ever saw
+  // a command timeout. Keep a generous per-body limit and report rejections.
+  const maxResultBodyBytes = options.maxResultBodyBytes ?? 64 * 1024 * 1024;
+  const maxDiagBodyBytes = 2 * 1024 * 1024;
   const allowedOrigins = new Set((options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS).map(normalizeOrigin));
   const log = options.log ?? (() => {});
 
@@ -155,16 +161,32 @@ export function createBridge(options) {
     writeState();
   }
 
-  function readBody(req) {
+  function readBody(req, limitBytes) {
     return new Promise((resolve, reject) => {
       let body = "";
+      let tooLarge = false;
       req.setEncoding("utf8");
       req.on("data", (chunk) => {
+        if (tooLarge) return;
         body += chunk;
-        if (body.length > 1_000_000) reject(new Error("body too large"));
+        if (body.length > limitBytes) {
+          tooLarge = true;
+          const error = new Error(`body too large (> ${limitBytes} chars)`);
+          error.code = "BODY_TOO_LARGE";
+          error.limitBytes = limitBytes;
+          error.receivedBytes = body.length;
+          body = "";
+          // Drain the rest so the socket closes cleanly instead of resetting.
+          req.resume();
+          reject(error);
+        }
       });
-      req.on("end", () => resolve(body));
-      req.on("error", reject);
+      req.on("end", () => {
+        if (!tooLarge) resolve(body);
+      });
+      req.on("error", (error) => {
+        if (!tooLarge) reject(error);
+      });
     });
   }
 
@@ -289,7 +311,8 @@ export function createBridge(options) {
       return;
     }
     if (req.method === "POST" && (url.pathname === "/result" || url.pathname === "/diag")) {
-      readBody(req).then(
+      const limitBytes = url.pathname === "/result" ? maxResultBodyBytes : maxDiagBodyBytes;
+      readBody(req, limitBytes).then(
         (body) => {
           let value;
           try {
@@ -306,6 +329,19 @@ export function createBridge(options) {
           }
         },
         (error) => {
+          if (error !== null && typeof error === "object" && error.code === "BODY_TOO_LARGE") {
+            sticky.lastRejectedBody = {
+              path: url.pathname,
+              limitBytes: error.limitBytes,
+              receivedBytes: error.receivedBytes,
+              at: new Date().toISOString(),
+            };
+            writeState();
+            log(`rejected ${url.pathname} body (${error.receivedBytes} > ${error.limitBytes} chars)`);
+            res.writeHead(413, { "content-type": "text/plain" });
+            res.end("body too large");
+            return;
+          }
           res.writeHead(400, { "content-type": "text/plain" });
           res.end(String(error));
         },

@@ -174,15 +174,22 @@ export function loadClientBundle(clientFile, options = {}) {
     constructor() {
       this.naturalWidth = options.imageNaturalWidth ?? 1280;
       this.naturalHeight = options.imageNaturalHeight ?? 800;
+      this.onload = null;
+      this.onerror = null;
       this._src = "";
     }
     set src(value) {
       this._src = String(value);
+      if (options.imageOnload === true) {
+        // No decode() to wait for: the load fallback must still complete.
+        Promise.resolve().then(() => this.onload?.());
+      }
     }
     get src() {
       return this._src;
     }
     decode() {
+      if (options.imageDecodeHangs === true) return new Promise(() => {});
       return Promise.resolve();
     }
   }

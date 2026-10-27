@@ -3,7 +3,7 @@
 > 状态：Phase 0 进行中 —— S2（Host↔Client 桥）**已验证通过**（2026-10-22）；
 > S1（侧边栏 webview 控制）代码完成、等待重启验证；测试先行流程已建立（§10）。
 > 事故复盘见 §0。
-> 最后更新：2026-10-22。
+> 最后更新：2026-10-27（§34.8 第二轮迭代，0.2.4）。
 
 ## 0. 事故复盘：重启后无限加载（2026-10-22）
 
@@ -705,4 +705,169 @@ sandbox 场景。截图相关的 fullPage/元素/clip/qa 待 0.2.2 重启后再�
 `::-webkit-scrollbar{display:none}`，截完移除），这样每段不再带滚动条残影，内容宽度也不再有 15px
 偏差；回执 `fullPage.scrollbarsHidden` 如实标注。已知边界仍是 `position:fixed/sticky` 会重复。
 真机复验需再重启一次。
+
+### 34.8 第二轮迭代（2026-10-27，0.2.3 → 0.2.4）
+
+数据来源：`dsh-plugins/research/feedback-round2-2026-10-27.md`（Lead 真机复现与诊断）。
+本轮五项交付 A–E，全部只动本仓库（Host/Client/测试/文档），无新依赖；改动**未重启复验**，
+需下一轮重启后按下面的真机清单逐项验证。
+
+#### A. 重启后首次 open 超时自动恢复（0.2.4）
+
+- 现象：DSH 重启后第一次 `browser open` 报 `panel did not become ready in time`，
+  status `hasWebview:true` 但 `client.ready:false`——webview 存在但 `dom-ready` 永不到来；
+  手动 close→open 恢复。
+- 实现：`ensurePanelReady()`（open/navigate 共用）在首次 `waitReady(2.5s)` 失败后判定 stale：
+  `unmount()`（释放 lease，但保留 `lastMountContainer`）→ 重挂一次 → 再 `waitReady(2.5s)`；
+  仍失败则回退浮动面板（§24 的既有路径），最终失败抛出的错误**包含 close/open 恢复指引**。
+  全程 postDiag（`ready-stale` / `stale-remount-failed` / `stale-remounted`）。
+- 测试：首次 mount 永不 dom-ready → 只重挂一次（两次 acquire、释放旧 lease）→ open 成功；
+  重挂 + 浮动面板都失败时错误信息含 `close the Agent Browser tab and call action=open`。
+
+#### B. fullPage 外网页面超时（0.2.4，最高优先）
+
+- Lead 复现事实：本地 127.0.0.1 页（1280×900、3500px、4 段）**秒级成功**；
+  `github.com/Dax233`（3484px）与 `en.wikipedia.org/wiki/GitHub`（21879px，cap 12000）
+  稳定 **25s 超时**（Host 默认命令超时）。同页普通截图 0.53s，手动 hide+scroll+capture 正常
+  → 挂点不在 capturePage 本身，在拼接/恢复路径。
+- **根因结论：未最终确定（真机诊断待证）**，但静态审计找到一类与症状完全吻合的挂点：
+  0.2.3 拼接路径里存在多处**无超时 await**——段 `Image.decode()`（stitch 内）、
+  hide/滚动/量测/恢复的 `executeJavaScript`（恢复步骤在 finally 里，若页面被卡住会让错误路径也挂死）
+  ——任何一个在某些页面永不 resolve，都会精确复现「到 Host 25s 超时」的症状。
+  代码里没有能区分是哪一步的证据能力（这正是 25s 只见超时不见错误的原因）。
+- 0.2.4 的处理（双保险）：
+  1. **所有 await 全部加超时**：capturePage 降到 8s（可配置 `captureTimeoutMs`）、段图
+     `Image.decode()` race 1.5s（decode + onload/onerror 双兜底 + 超时抛带 phase 的错误）、
+     hide/scrollTo/scrollState/恢复步骤全部限 8s / 恢复 2.5s；
+  2. **总预算**：整个 fullPage 默认 60s（可配置），超时抛错并带段数/已用时间，绝不无限挂；
+  3. **阶段诊断**：每步 `void postDiag("fullpage", {phase, ms, index})`
+     （begin/hideScrollbars/segment-start/segment-capture/segment-encode/stitch/restore/error），
+     写进 bridge diags 环形缓冲（无需面板即可在 `%TEMP%\dsh-browser-control-state.json` 查看）；
+     成功回执带 `fullPage.timings`（totalMs + 每段 capture/encode 耗时 + 段数）；
+  4. **Host 侧长超时**：`screenshot fullPage:true` 用 120s 单命令超时
+     （`DSH_BROWSER_CONTROL_FULLPAGE_TIMEOUT_MS` 可配），普通截图保持默认；qa 全身已用 120s。
+     行为级测试：fake client 3s 后才应答（超过 2s 默认超时），fullPage 成功返回
+     → 证明长超时生效；非 fullPage 不受影响。
+- 下一轮真机按 postDiag 阶段数据定位最终根因（哪个 phase 在外网页面不 resolve）。
+  **→ 已在 2026-10-27 真机定位并修复，见 §34.9：根因不在这些 await，而在 bridge 的
+  `/result` 请求体 1MB 上限。**
+
+#### C. emulate 的原生 `<picture>`/`<link media>` DOM 兜底（0.2.4）
+
+- 原理：资源选择不受 matchMedia shim/CSSOM 影响；GitHub themed-picture 在 open shadow DOM 内。
+  `emulateJs` 扩展为：restore → 深度遍历 `document` + 所有 open `shadowRoot`
+  （`element.shadowRoot` 递归，**节点预算 6000**，超限 `limitReached` 如实报告）→
+  对每个 `<picture>` 按模拟 scheme 选第一个「无 media 或 media 匹配」的 source
+  （用 `rewriteColorSchemeQuery` + 原生 matchMedia 求值；无匹配不动，保留浏览器自己的回退），
+  把 `img.srcset`（或 `src`）设为该 source；每个 patch 保存原始值；`<link rel=stylesheet media>`
+  含 prefers-color-scheme 的置 `all` / `not all`，保存原值。
+- `auto` 完整恢复（picture 的 src/srcset、link 的 media）；重放/定时重扫也会先 restore 再 patch。
+- 回执新增 `dom: { picturesPatched, linkMediaPatched, restored, visited, limitReached }`，
+  Host 文本如实转述。
+- 边界（README 同步）：JS 运行时驱动选图的页面、closed shadow DOM、CSS image-set 不覆盖。
+- 测试：dark/light 选择、light 下无匹配 source 不动、shadowRoot 内 picture、link media 归一化与 auto 还原。
+
+#### D. viewport 滚动条与 contentWidth（0.2.4）
+
+- `viewport {scrollbars:"auto"|"hidden"}`（默认 auto）：hidden 注入与 fullPage 相同的隐藏
+  滚动条 CSS 并**持久**（导航后重放，`viewport reset` / `close` 移除并回到 auto）。
+- 回执与 `actual` 增加 `contentWidth`（`documentElement.clientWidth`）；Host 文本在
+  innerWidth > contentWidth 时说明「经典滚动条差 N px」，hidden 时说明
+  「content width == 视口宽 + 由 reset/close 恢复」。
+- `qa {scrollbars:"auto"|"hidden"}` 透传到每个 variant 的 viewport 命令；
+  QA 结果表新增 content 列。
+- 测试：hidden 后 contentWidth == width、切回 auto 移除样式并按 mock 报
+  （innerWidth−15）、导航重放、reset 移除；Host：viewport/qa 校验与透传、回执文本。
+
+#### E. 超长元素截图逐屏拼接（0.2.4）
+
+- 元素截图（ref/selector）先由 `__dshAgentScreenshotTarget` 量出元素**页面坐标** full rect
+  （新增 `full`/`scrollX`/`scrollY`；兼容字段保持不变）。
+- 当元素高于视口或部分在视口外时，不再裁到第一屏：`captureTallElement` 逐屏
+  （hide scrollbar → scrollTo(behavior instant) → `capturePage(rect)` 截元素可见带 →
+  canvas 拼接），与 fullPage **共享拼接基建**（同一个 `stitchSegments`：canvas/decode 超时/
+  encode/回执），但回执字段独立：
+  `element: { stitched, segments, fullRect, fullHeight, fullWidth, capturedHeight, capped, croppedWidth, scrollbarsHidden, timings }`；
+  mode 保持 `element`；总高 cap 12000（capped 标注）；宽超视口部分裁剪并报 `croppedWidth`，
+  不伪造；截完恢复滚动位置与滚动条。
+- 测试：三段拼接逐段 rect/画布 y 对齐 + 恢复滚动/滚动条、cap 与 capped、超宽裁剪。
+
+#### 单测与状态
+
+- 0.2.4 完成时：**117 项全绿**（基线 101 + 新增 16：client +8、scripts +4、host +4）。
+  `npm test` 全绿；BOOT CONTRACT 保持（apply 同步返回 undefined）。
+- 未做（如实）：DPR/file:// 依旧不做（平台事实）；不重启 DSH 无法真机复验。
+
+#### 真机待验清单（重启 DSH 后）
+
+1. 重启后第一次 `browser open` 直接成功（stale 恢复：或自动重挂成功，或报错带 close/open 指引）。
+2. `github.com/Dax233` / Wikipedia 长页 `screenshot {fullPage:true}`：
+   看 `%TEMP%\dsh-browser-control-state.json` 的 `diags` 里 fullpage 各 phase 的 ms，
+   确定卡点 phase；若 60s 预算内完成则看回执 timings（总耗时、每段 capture/encode）。
+3. GitHub profile 页 `emulate {colorScheme:"dark"}`：themed-picture（shadow DOM）切图正确，
+   回执 `dom.picturesPatched > 0`；`auto` 完全还原。
+4. `viewport {width:1280, scrollbars:"hidden"}` → metrics 的 doc 宽 == 视口宽（1265→1280），
+   回执 contentWidth；导航（open/navigate）后仍隐藏；reset 后恢复。
+5. `.markdown-body`（1833px 高）`screenshot {selector:"css-0"}`：完整高度拼接图
+   （mode=element + stitched/segments=3），fixed/sticky 重复为已知外观边界。
+6. `qa {scrollbars:"hidden"}`：表 content 列全等于视口宽。
+
+#### 风险
+
+- capturePage/decode 超时若在外网页面普遍触发（而非停在单点），会把「25s 超时」变成
+  「阶段错误」——结论相同但路径不同，预算与段数信息会帮助定位。
+- picture DOM 兜底对 JS 框架强管理的 img（React 重置 src）只保证 apply 时点正确；
+  框架后续渲染由 MutationObserver/定时重扫补丁（restore→re-patch）。
+- 元素拼接与 fullPage 复用 `stitchSegments`，若 canvas 尺寸超限（>12000 或超宽）报错而非降级。
+
+### 34.9 真机复验与 fullPage 根因（2026-10-27，0.2.4 → 0.2.5）
+
+0.2.4 重启后真机（sidebar 0.2.4 / 扩展 0.1.30）：
+
+- **首次 `browser open` 一次成功**（本次未复现 34.8 A 的 stale 超时；恢复逻辑仍在，作为兜底）。
+- `viewport {1280×900}`：回执 `content width 1265 (innerWidth is larger by 15px: classic scrollbar)`，
+  即 34.8 D 的 `contentWidth` 已生效。
+- **fullPage 仍然失败（25–120s 超时），但阶段诊断直接给出了真相**：
+  `%TEMP%\dsh-browser-control-state.json` 的 `diags.fullpage` 显示
+  `begin(3ms) → hideScrollbars(74ms) → 4 段 segment-capture 33–66ms/段 → stitch(654ms) → restore(799ms)`，
+  也就是说 **client 799ms 就完成了整张拼接图并回传**，没有任何一步卡住。
+- 继续验证：同一页 `screenshot {fullPage:true, format:"jpeg", quality:70}` → **669ms 成功**，
+  1280×3496、211 KB。两张图只差格式 → 一定是 **结果回传被 bridge 丢掉**。
+- **最终根因**：`bridge.js` 的 `readBody` 把所有 POST body 限制在 **1,000,000 字符**；
+  外网长页的 fullPage **PNG** base64 有数 MB，`/result` 请求被 400 拒绝且无任何状态记录，
+  Host 端只能等到命令超时（本地预览页是纯色，PNG 极小所以一直"秒过"）。
+  JPEG 压缩后 211KB 没触限，所以"只有 PNG 的 fullPage 失败"。
+- **0.2.5 修复**：
+  1. bridge `/result` body 上限提高到 **64MB**（`maxResultBodyBytes` 可配；`/diag` 单独 2MB）；
+  2. 超限时返回 **413** 并在 diag state 记录 `sticky.lastRejectedBody`
+     （path / limitBytes / receivedBytes / at），不再静默丢弃；
+  3. client 在 POST 前预检 JSON 长度（**48MB**），超限直接返回可操作的错误
+     （"use format jpeg / smaller clip"），并对非 2xx 回执补 `postDiag("result-rejected")`；
+  4. 测试新增 2 项：3MB 结果 body 正常送达（回归 fullPage PNG）、超限 body 413 + 
+     `lastRejectedBody` + 命令按超时失败（不会挂死）。
+- 仍待真机复验（下一轮重启后）：C（picture 兜底）、E（高元素拼接）、`qa {scrollbars:"hidden"}`，
+  以及 chrome 0.1.30 的 networkIdle best-effort（独立扩展 reload）。
+
+### 34.10 真机复验第二轮（2026-10-27，0.2.5 → 0.2.6）
+
+0.2.5 重启后（bridge 64MB 修复已生效）：
+
+- **fullPage PNG 修复确认**：`github.com/Dax233` → 1280×3496 PNG **1.45MB / 798ms / 4 段**成功
+  （1.45MB 文件 ≈1.9MB base64，正好是旧 1MB 上限丢掉的量）；`en.wikipedia.org/wiki/GitHub`
+  → 1280×12000 PNG **9.5MB / 2929ms / 14 段**成功，capped 标注正确。
+- `viewport` 回执 `contentWidth 1265（innerWidth 大 15px：经典滚动条）`；首次 open 一次成功。
+- **`<picture>` 兜底真机复验发现新 bug（0.2.4 实现不完整）**：探针页（base64 data URI 的
+  light/dark `<source media>`，含 open shadowRoot 版本）在 **light 模拟下图片仍是 dark 版**、
+  auto 也回不去；DOM 属性检查显示 img 的 `src` 已是 light、`srcset` 已移除，但
+  `img.currentSrc`/`naturalWidth` 仍是 dark 图。
+  根因：**这台机器的真实浏览器偏好是 dark**，`<picture>` 里 media 匹配的 dark `<source>`
+  永远胜出，img 自己的 `src`/`srcset` 被忽略——0.2.4 只改 img 属性，既无法让 light 版生效，
+  restore 重挂时也会被真实偏好再次覆盖（dark 模拟"看起来生效"只是因为本来就已经是 dark）。
+  修复（0.2.6）：patch 时把该 picture 内**所有 `<source>` 的 `media` 临时改成 `not all`**
+  （让 img 的 src/srcset 决定），再设置目标变体；若模拟 scheme 没有任何匹配 source，
+  回退到 img 自己的 src；`auto` 时先还原每个 source 的 original media，再还原 img 的 src/srcset，
+  浏览器随即按真实偏好重新选择。测试同步更新（原"无匹配 source 不动"改为"neutralise + 回退 + auto 还原"）。
+- 真机复验结论（0.2.6 重启后补）：light 模拟 → LIGHT IMAGE / SHADOW LIGHT；dark → DARK /
+  SHADOW DARK；auto → 回到真实偏好（dark）。
+
 

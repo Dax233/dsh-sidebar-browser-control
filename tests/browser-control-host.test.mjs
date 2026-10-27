@@ -8,6 +8,9 @@ const TEST_TOKEN = "browser-control-test-token";
 process.env.DSH_BROWSER_CONTROL_PORT = "0";
 process.env.DSH_BROWSER_CONTROL_TOKEN = TEST_TOKEN;
 process.env.DSH_BROWSER_CONTROL_COMMAND_TIMEOUT_MS = "2000";
+// The behavioral fullPage-timeout test below answers after 3s: longer than the
+// 2s default command timeout, shorter than the dedicated fullPage window.
+process.env.DSH_BROWSER_CONTROL_FULLPAGE_TIMEOUT_MS = "5000";
 process.env.DSH_BROWSER_CONTROL_STATE = join(mkdtempSync(join(tmpdir(), "dsh-bc-host-")), "state.json");
 process.env.DSH_BROWSER_CONTROL_SHOT_DIR = join(mkdtempSync(join(tmpdir(), "dsh-bc-shots-")), "shots");
 
@@ -168,8 +171,11 @@ async function waitForPort(tool) {
   throw new Error("bridge did not start");
 }
 
-function startFakeClient(port, received, isStopped) {
-  const answer = (command) => {
+function startFakeClient(port, received, isStopped, options = {}) {
+  const answer = async (command) => {
+    if (command.fullPage === true && command.type === "screenshot" && options.slowFullPageMs) {
+      await new Promise((resolve) => setTimeout(resolve, options.slowFullPageMs));
+    }
     switch (command.type) {
       case "open":
         return { ok: true, url: command.url };
@@ -205,7 +211,17 @@ function startFakeClient(port, received, isStopped) {
           mode: command.fullPage === true ? "fullPage" : "viewport",
           devicePixelRatio: 1,
           ...(command.fullPage === true
-            ? { fullPage: { requestedHeight: 24000, capturedHeight: 12000, capped: true, segments: 17, stitched: true, viewportHeight: 742 } }
+            ? {
+                fullPage: {
+                  requestedHeight: 24000,
+                  capturedHeight: 12000,
+                  capped: true,
+                  segments: 17,
+                  stitched: true,
+                  viewportHeight: 742,
+                  timings: { totalMs: 4231, segments: 17, captureMs: [10, 12], encodeMs: [14, 16] },
+                },
+              }
             : {}),
         };
       case "viewport":
@@ -298,8 +314,7 @@ function startFakeClient(port, received, isStopped) {
       default:
         return { ok: true };
     }
-  };
-  const promise = (async () => {
+  };  const promise = (async () => {
     while (!isStopped()) {
       try {
         const auth = { authorization: `Bearer ${TEST_TOKEN}` };
@@ -311,7 +326,7 @@ function startFakeClient(port, received, isStopped) {
           await fetch(`http://127.0.0.1:${port}/result?id=${encodeURIComponent(message.id)}`, {
             method: "POST",
             headers: { ...auth, "content-type": "application/json" },
-            body: JSON.stringify(answer(message.cmd)),
+            body: JSON.stringify(await answer(message.cmd)),
           });
         }
       } catch {
@@ -360,11 +375,11 @@ async function withHarness(run) {
   }
 }
 
-async function withFakeClient(tool, run) {
+async function withFakeClient(tool, run, options = {}) {
   let stopped = false;
   const received = [];
   const port = await waitForPort(tool);
-  const client = startFakeClient(port, received, () => stopped);
+  const client = startFakeClient(port, received, () => stopped, options);
   try {
     return await run(received, port);
   } finally {
@@ -760,6 +775,137 @@ test("0.2.0 host status: merges connected-client viewport/theme/console/last url
       assert.equal(status.lastTitle, "Example Domain");
       assert.equal(status.client.hasWebview, true);
       assert.equal(received.at(-1).type, "status");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.4 round 2: fullPage long bridge timeout, viewport scrollbars/contentWidth,
+// qa scrollbars pass-through, stitched element/fullPage timings receipts.
+// ---------------------------------------------------------------------------
+
+test("0.2.4 host dispatch: viewport scrollbars validation and qa plan scrollbars", () => {
+  const { toCommand, buildQaPlan } = plugin.__test;
+  assert.deepEqual(toCommand("viewport", { width: 390, scrollbars: "hidden" }), {
+    type: "viewport",
+    width: 390,
+    height: 800,
+    scrollbars: "hidden",
+  });
+  assert.equal(toCommand("viewport", { width: 390 }).scrollbars, undefined, "scrollbars defaults to the client's auto mode");
+  assert.throws(() => toCommand("viewport", { width: 390, scrollbars: "overlay" }), /scrollbars/);
+  const plan = buildQaPlan({ url: "https://example.com/", widths: [640], themes: ["dark"], scrollbars: "hidden" });
+  assert.equal(plan.scrollbars, "hidden", "qa must carry scrollbars into each variant's viewport command");
+  assert.equal(buildQaPlan({ url: "https://example.com/", widths: [640] }).scrollbars, "auto", "qa scrollbars default to auto");
+  assert.throws(() => buildQaPlan({ url: "https://example.com/", widths: [640], scrollbars: "overlay" }), /scrollbars/);
+});
+
+test("0.2.4 host screenshot: fullPage rides the dedicated long timeout instead of the command default", async () => {
+  assert.equal(plugin.__test.FULLPAGE_SCREENSHOT_TIMEOUT_MS, 5000, "the dedicated fullPage window must be env-configurable");
+  const target = join(tmpdir(), "dsh-bc-fullpage-longtime.png");
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(
+      tool,
+      async (received) => {
+        const started = Date.now();
+        const result = await tool.execute({ action: "screenshot", fullPage: true, path: target });
+        const elapsed = Date.now() - started;
+        // The fake client answers after 3s: under the 2s default command
+        // timeout this would come back as "no client result before timeout".
+        assert.match(result.text, /screenshot saved/, `expected success, got: ${result.text}`);
+        assert.ok(elapsed >= 2900, `the slow fullPage answer must not be cut by the command default (elapsed ${elapsed}ms)`);
+        assert.ok(elapsed < 15000);
+        assert.equal(received[0].fullPage, true);
+        assert.match(result.text, /took \d+ms/, "the receipt reports the client's stitch timings");
+      },
+      { slowFullPageMs: 3000 },
+    );
+  });
+});
+
+test("0.2.4 host receipts: viewport explains contentWidth, stitched elements and DOM fallback", () => {
+  const { formatResult: format } = plugin.__test;
+  const classic = format("viewport", {
+    width: 800,
+    height: 600,
+    scale: 1,
+    matched: true,
+    settledMs: 30,
+    scrollbars: "hidden",
+    actual: { innerWidth: 800, innerHeight: 600, devicePixelRatio: 1, contentWidth: 800 },
+  });
+  assert.match(classic, /content width 800/);
+  assert.match(classic, /page scrollbars hidden/);
+  const scrollbarNote = format("viewport", {
+    width: 1280,
+    height: 800,
+    scale: 1,
+    matched: true,
+    settledMs: 30,
+    actual: { innerWidth: 1280, innerHeight: 800, devicePixelRatio: 1, contentWidth: 1265 },
+  });
+  assert.match(scrollbarNote, /content width 1265 \(innerWidth is larger by 15px: classic scrollbar\)/);
+  const stitched = plugin.__test.buildScreenshotNotes({
+    mode: "element",
+    element: {
+      target: { label: "Readme" },
+      clippedToViewport: false,
+      stitched: true,
+      segments: 4,
+      fullHeight: 1833,
+      fullWidth: 831,
+      capturedHeight: 1833,
+      capped: false,
+      croppedWidth: 120,
+      scrollbarsHidden: true,
+      timings: { totalMs: 2400, segments: 4, captureMs: [], encodeMs: [] },
+    },
+  }).join("; ");
+  assert.match(stitched, /element capture/);
+  assert.match(stitched, /stitched 4 scroll capture\(s\) for the element's full height \(1833 of 1833 CSS px\)/);
+  assert.match(stitched, /120px beyond the viewport width were cropped/);
+  const cappedShot = plugin.__test.buildScreenshotNotes({
+    mode: "element",
+    element: { stitched: true, segments: 14, capturedHeight: 1200, capped: true, fullHeight: 5000, croppedWidth: 0 },
+  }).join("; ");
+  assert.match(cappedShot, /1200 capped of 5000 CSS px/);
+  const dom = format("emulate", {
+    scheme: "dark",
+    sheets: { scanned: 2, patched: 1 },
+    mediaRules: { patched: 1, restored: 0 },
+    dom: { picturesPatched: 2, linkMediaPatched: 1, restored: 0, visited: 900, limitReached: false },
+  });
+  assert.match(dom, /DOM fallback: 2 <picture> re-picked, 1 <link media> normalized, 0 restored/);
+  const domLimited = format("emulate", {
+    scheme: "dark",
+    dom: { picturesPatched: 1, linkMediaPatched: 0, restored: 0, visited: 6000, limitReached: true },
+  });
+  assert.match(domLimited, /node scan hit its limit after 6000 nodes/);
+});
+
+test("0.2.4 host qa: viewport commands carry scrollbars and the result table reports content width", async () => {
+  const outDir = mkdtempSync(join(tmpdir(), "dsh-bc-qa-"));
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(tool, async (received) => {
+      const result = await tool.execute({
+        action: "qa",
+        url: "https://example.com/",
+        widths: [640],
+        themes: ["dark"],
+        height: 700,
+        outDir,
+        scrollbars: "hidden",
+      });
+      assert.match(result.text, /scrollbars hidden/);
+      assert.match(result.text, /^width \| theme \| viewport \| content \|/m, "the table gains a content width column");
+      const viewportCommands = received.filter((command) => command.type === "viewport");
+      assert.ok(viewportCommands.length >= 2, "one variant viewport + the reset");
+      for (const command of viewportCommands.slice(0, -1)) {
+        assert.equal(command.scrollbars, "hidden", "each variant viewport command must carry the plan's scrollbars");
+      }
+      assert.equal(viewportCommands.at(-1).reset, true, "the reset restores auto scrollbars");
     });
   });
 });

@@ -184,6 +184,53 @@ test("bridge: a command pushed before a poll is delivered to that poll", async (
   }
 });
 
+test("bridge: a multi-megabyte result body is accepted (regression: fullPage PNG)", async () => {
+  const bridge = makeBridge({ pollTimeoutMs: 500 });
+  const port = await bridge.start();
+  try {
+    const pollPromise = authed(port, "/poll?client=c1").then((r) => r.json());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const commandPromise = bridge.pushCommand({ type: "screenshot" });
+    const delivered = await pollPromise;
+    // Real fullPage PNGs of external sites base64-encode to several MB; the old
+    // 1 MB body cap silently dropped them and the Host only saw a timeout.
+    const dataUrl = `data:image/png;base64,${"A".repeat(3 * 1024 * 1024)}`;
+    const result = await authed(port, `/result?id=${encodeURIComponent(delivered.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: true, dataUrl }),
+    });
+    assert.equal(result.status, 200);
+    const outcome = await commandPromise;
+    assert.equal(outcome.value.dataUrl.length, dataUrl.length);
+  } finally {
+    bridge.close();
+  }
+});
+
+test("bridge: an over-limit result body is rejected with 413 and recorded", async () => {
+  const bridge = makeBridge({ pollTimeoutMs: 500, maxResultBodyBytes: 1000 });
+  const port = await bridge.start();
+  try {
+    const pollPromise = authed(port, "/poll?client=c1").then((r) => r.json());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const commandPromise = bridge.pushCommand({ type: "screenshot" }, 300);
+    const delivered = await pollPromise;
+    const result = await authed(port, `/result?id=${encodeURIComponent(delivered.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: true, padding: "x".repeat(5000) }),
+    });
+    assert.equal(result.status, 413);
+    assert.equal(bridge.sticky.lastRejectedBody?.path, "/result");
+    assert.ok(bridge.sticky.lastRejectedBody?.receivedBytes > 1000);
+    // The dropped result must still surface as a command timeout, not a hang.
+    await assert.rejects(() => commandPromise, /no client result before timeout/);
+  } finally {
+    bridge.close();
+  }
+});
+
 test("bridge: /diag appends sticky diagnostics", async () => {
   const bridge = makeBridge();
   const port = await bridge.start();

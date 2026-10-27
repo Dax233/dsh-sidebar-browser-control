@@ -433,8 +433,7 @@ test("scripts: bytesToBase64 matches Buffer, and imageToDataUrl prefers context-
   assert.match(sandboxedJpeg, /^data:image\/jpeg;base64,/, "JPEG must fall back to a canvas re-encode");
 });
 
-test("scripts: clampRect clamps into the viewport and isBlankUrl recognises about:blank", () => {
-  assert.deepEqual(plain(helpers.clampRect({ x: 10, y: 20, width: 100, height: 50 }, { width: 575, height: 742 })), {
+test("scripts: clampRect clamps into the viewport and isBlankUrl recognises about:blank", () => {  assert.deepEqual(plain(helpers.clampRect({ x: 10, y: 20, width: 100, height: 50 }, { width: 575, height: 742 })), {
     x: 10,
     y: 20,
     width: 100,
@@ -457,4 +456,145 @@ test("scripts: clampRect clamps into the viewport and isBlankUrl recognises abou
   assert.equal(helpers.isBlankUrl("about:blank#lease-1"), true);
   assert.equal(helpers.isBlankUrl("https://example.com/"), false);
   assert.equal(helpers.isBlankUrl(""), false);
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.4: emulate DOM fallback for native <picture>/<source media> and
+// <link rel=stylesheet media>, including open shadow roots.
+// ---------------------------------------------------------------------------
+
+/** Minimal fake element with an attribute map (mirrors real DOM semantics used by the shim). */
+function makeFakeEl(tag, attrs = {}) {
+  const attributes = { ...attrs };
+  return {
+    tagName: String(tag).toUpperCase(),
+    getAttribute: (name) => (Object.prototype.hasOwnProperty.call(attributes, name) ? attributes[name] : null),
+    setAttribute: (name, value) => {
+      attributes[name] = String(value);
+    },
+    removeAttribute: (name) => {
+      delete attributes[name];
+    },
+    shadowRoot: undefined,
+  };
+}
+
+function makePicturePage({ sources = [], imgAttrs = {}, shadowPictures = [] } = {}) {
+  const img = makeFakeEl("img", { ...imgAttrs });
+  const picture = {
+    tagName: "PICTURE",
+    querySelector: (selector) => (selector === "img" ? img : null),
+    querySelectorAll: (selector) => (selector === "source" ? sources : []),
+  };
+  // An open shadow root can only be reached through element.shadowRoot.
+  const hosts = shadowPictures.map((shadowPage) => {
+    const host = makeFakeEl("div");
+    host.shadowRoot = {
+      querySelectorAll: (selector) => (selector === "picture" ? [shadowPage.picture] : []),
+    };
+    return host;
+  });
+  const darkLink = makeFakeEl("link", { rel: "stylesheet", media: "(prefers-color-scheme: dark)" });
+  const document = {
+    styleSheets: [],
+    documentElement: { style: { colorScheme: "" } },
+    title: "Dom Page",
+    fonts: { status: "loaded", size: 1 },
+    images: [],
+    body: { innerText: "" },
+    querySelector: () => null,
+    querySelectorAll: (selector) => {
+      if (selector === "picture") return [picture];
+      if (selector === "link[media]") return [darkLink];
+      if (selector === "*") return hosts;
+      return [];
+    },
+    scrollingElement: { scrollWidth: 800, scrollHeight: 600, scrollTop: 0 },
+  };
+  const window = { matchMedia: nativeMatchMedia(800), innerWidth: 800, innerHeight: 600, devicePixelRatio: 1, scrollY: 0 };
+  const sandbox = {
+    window,
+    document,
+    performance: { getEntriesByType: () => [], now: () => 0 },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    setTimeout: () => 1,
+    setInterval: () => 1,
+    clearInterval: () => {},
+    getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+    console: { log() {}, warn() {}, error() {} },
+  };
+  sandbox.globalThis = sandbox;
+  return { sandbox, img, picture, darkLink, hosts };
+}
+
+test("scripts: emulate re-picks <picture> sources per scheme and fully restores on auto", () => {
+  const page = makePicturePage({
+    sources: [
+      makeFakeEl("source", { media: "(prefers-color-scheme: dark)", srcset: "dark.png 1x" }),
+      makeFakeEl("source", { srcset: "light.png 1x" }),
+    ],
+    imgAttrs: { src: "base.png" },
+  });
+  const dark = runInPage(helpers.emulateJs("dark"), page.sandbox);
+  assert.equal(page.img.getAttribute("srcset"), "dark.png 1x", "dark re-picks the dark source");
+  assert.equal(page.img.getAttribute("src"), "base.png", "theme-unrelated src attributes are left alone");
+  assert.equal(dark.dom.picturesPatched, 1);
+
+  const light = runInPage(helpers.emulateJs("light"), page.sandbox);
+  assert.equal(page.img.getAttribute("srcset"), "light.png 1x", "switching schemes re-picks the matching source");
+  assert.ok(light.dom.restored >= 1, "the previous picture patch is counted as restored");
+
+  const auto = runInPage(helpers.emulateJs("auto"), page.sandbox);
+  assert.equal(page.img.getAttribute("srcset"), null, "auto removes the patched srcset attribute");
+  assert.equal(page.img.getAttribute("src"), "base.png", "auto keeps the original src");
+  assert.ok(auto.dom.restored >= 1);
+});
+
+test("scripts: a <picture> with no matching source falls back to the img src and re-arms the source on auto", () => {
+  const darkSource = makeFakeEl("source", { media: "(prefers-color-scheme: dark)", srcset: "dark.png" });
+  const page = makePicturePage({
+    sources: [darkSource],
+    imgAttrs: { src: "base.png" },
+  });
+  const result = runInPage(helpers.emulateJs("light"), page.sandbox);
+  // While the dark <source> matches the REAL browser preference it overrides
+  // the img; neutralising it lets the light fallback show (a real dark-OS bug).
+  assert.equal(darkSource.getAttribute("media"), "not all", "the source is neutralised so the img fallback can win");
+  assert.equal(page.img.getAttribute("srcset"), null, "srcset stays as-is");
+  assert.equal(page.img.getAttribute("src"), "base.png", "img keeps its own source (the real browser fallback)");
+  assert.equal(result.dom.picturesPatched, 1);
+  runInPage(helpers.emulateJs("auto"), page.sandbox);
+  assert.equal(darkSource.getAttribute("media"), "(prefers-color-scheme: dark)", "auto re-arms the source media");
+  assert.equal(page.img.getAttribute("src"), "base.png");
+});
+
+test("scripts: <picture> inside an open shadow root is reached through element.shadowRoot", () => {
+  const shadowImg = makeFakeEl("img", { src: "base.png" });
+  const shadowPicture = {
+    tagName: "PICTURE",
+    querySelector: (selector) => (selector === "img" ? shadowImg : null),
+    querySelectorAll: (selector) => (selector === "source" ? [makeFakeEl("source", { media: "(prefers-color-scheme: dark)", srcset: "dark.png" })] : []),
+  };
+  const page = makePicturePage({ shadowPictures: [{ picture: shadowPicture }] });
+  const result = runInPage(helpers.emulateJs("dark"), page.sandbox);
+  assert.equal(shadowImg.getAttribute("srcset"), "dark.png", "the shadow-DOM themed picture gets the same DOM fallback");
+  assert.equal(result.dom.picturesPatched, 1);
+
+  runInPage(helpers.emulateJs("auto"), page.sandbox);
+  assert.equal(shadowImg.getAttribute("srcset"), null, "auto also restores shadow-DOM patches");
+});
+
+test("scripts: <link rel=stylesheet media=prefers-color-scheme> is normalized and restored", () => {
+  const page = makePicturePage({});
+  const dark = runInPage(helpers.emulateJs("dark"), page.sandbox);
+  assert.equal(page.darkLink.getAttribute("media"), "all", "a matching link media becomes 'all'");
+  assert.equal(dark.dom.linkMediaPatched, 1);
+  const light = runInPage(helpers.emulateJs("light"), page.sandbox);
+  assert.equal(page.darkLink.getAttribute("media"), "not all", "a non-matching link media becomes 'not all'");
+  const auto = runInPage(helpers.emulateJs("auto"), page.sandbox);
+  assert.equal(page.darkLink.getAttribute("media"), "(prefers-color-scheme: dark)", "auto restores the original media attribute");
+  assert.ok(auto.dom.restored >= 1);
 });

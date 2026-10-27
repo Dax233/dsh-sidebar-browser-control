@@ -7,6 +7,10 @@ window.__ModuleLoader__.load({
     const PORT = 47834;
     const TOKEN = "dsh-browser-control-local";
     const BASE = `http://127.0.0.1:${PORT}`;
+    // Keep well under the bridge's 64MB /result body limit; a full-page PNG of a
+    // real site can reach several MB base64, so fail with guidance instead of
+    // letting the bridge reject the body and the Host report a bare timeout.
+    const MAX_RESULT_CHARS = 48 * 1024 * 1024;
     // A plugin reload disposes the old body but DSH keeps its tab entry; opening
     // the same kind would only focus that stale, bodiless tab. A per-module-load
     // identity guarantees openTab places a fresh tab whose body mounts.
@@ -335,6 +339,10 @@ window.__ModuleLoader__.load({
           innerWidth: Math.round(window.innerWidth || 0),
           innerHeight: Math.round(window.innerHeight || 0),
           devicePixelRatio: window.devicePixelRatio || 1,
+          // The layout width the content actually gets: with the classic
+          // (non-overlay) scrollbar this is smaller than innerWidth by the
+          // scrollbar width.
+          contentWidth: Math.round((document.documentElement ? document.documentElement.clientWidth : 0) || (doc ? doc.clientWidth : 0) || 0),
           scrollWidth: Math.round(doc.scrollWidth || 0),
           scrollHeight: Math.round(doc.scrollHeight || 0)
         };
@@ -638,12 +646,15 @@ window.__ModuleLoader__.load({
           if (now === lastScrollY) break;
           lastScrollY = now;
         }
+        const doc = document.scrollingElement || document.documentElement;
         const rect = el.getBoundingClientRect();
         const viewport = {
           width: Math.round(window.innerWidth || 0),
           height: Math.round(window.innerHeight || 0),
           devicePixelRatio: window.devicePixelRatio || 1
         };
+        const scrollX = Math.round(window.scrollX || 0);
+        const scrollY = Math.round(window.scrollY || doc.scrollTop || 0);
         const clamp = (value, max) => Math.max(0, Math.min(Math.round(value), Math.max(0, max)));
         const x = clamp(rect.left, viewport.width);
         const y = clamp(rect.top, viewport.height);
@@ -662,6 +673,17 @@ window.__ModuleLoader__.load({
           viewport,
           rect: { x, y, width, height },
           clipped: width < Math.round(rect.width) || height < Math.round(rect.height),
+          // Page-space box of the whole element (used by the tall-element
+          // scroll-stitch): viewport coordinates shift when scrollbars hide or
+          // the page scrolls, page coordinates do not.
+          full: {
+            x: Math.round(rect.left + scrollX),
+            y: Math.round(rect.top + scrollY),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          },
+          scrollX,
+          scrollY,
           target: {
             tag: el.tagName.toLowerCase(),
             label: String(el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 80)
@@ -754,6 +776,156 @@ window.__ModuleLoader__.load({
             };
           }
         }
+        // -----------------------------------------------------------------
+        // DOM fallback (0.2.4): <picture><source media="…prefers-color-scheme…">
+        // and <link rel=stylesheet media="…"> are resolved by the resource
+        // loader, not by CSSOM or the matchMedia shim; a rewritten stylesheet
+        // cannot reroute them (GitHub's themed-picture lives inside an open
+        // shadow root). Re-pick the source in the DOM itself, walking the
+        // document and every open shadowRoot under a node budget so a huge
+        // page cannot wedge the call. Every patch stores its original value
+        // for full restore on scheme=? or auto.
+        // -----------------------------------------------------------------
+        const DOM_NODE_LIMIT = 6000;
+        if (!Array.isArray(state.pictures)) state.pictures = [];
+        if (!Array.isArray(state.links)) state.links = [];
+        const setOrRemove = (el, name, value) => {
+          if (value === undefined || value === null) { try { el.removeAttribute(name); } catch (error) {} }
+          else { try { el.setAttribute(name, value); } catch (error) {} }
+        };
+        const evaluateMedia = (text) => {
+          if (!state.nativeMatchMedia) return null;
+          try { return !!state.nativeMatchMedia(rewrite(text, SCHEME).query).matches; } catch (error) { return null; }
+        };
+        const restoreDomPatches = () => {
+          let restored = 0;
+          for (const entry of state.pictures) {
+            try {
+              // Restore the <source> media first: re-arming them makes the
+              // browser re-run picture selection with the restored img attrs.
+              if (Array.isArray(entry.sources)) {
+                for (const source of entry.sources) {
+                  if (source && source.el) setOrRemove(source.el, 'media', source.media);
+                }
+              }
+              setOrRemove(entry.img, 'srcset', entry.srcset);
+              setOrRemove(entry.img, 'src', entry.src);
+              restored += 1;
+            } catch (error) {}
+          }
+          state.pictures = [];
+          for (const entry of state.links) {
+            try { setOrRemove(entry.link, 'media', entry.media); restored += 1; } catch (error) {}
+          }
+          state.links = [];
+          return restored;
+        };
+        const chooseSource = (sources) => {
+          for (const source of sources) {
+            if (!source || typeof source.getAttribute !== 'function') continue;
+            let media;
+            try { media = source.getAttribute('media'); } catch (error) { media = null; }
+            const text = String(media ?? '').trim();
+            if (text === '') return source;
+            if (COLOR_SCHEME.test(text)) {
+              if (evaluateMedia(text) === true) return source;
+            } else if (state.nativeMatchMedia) {
+              try { if (state.nativeMatchMedia(text).matches) return source; } catch (error) {}
+            }
+          }
+          return undefined;
+        };
+        const patchDom = () => {
+          const dom = { picturesPatched: 0, linkMediaPatched: 0, visited: 0, limitReached: false };
+          const pictures = [];
+          const links = [];
+          const scanRoot = (root) => {
+            if (dom.visited >= DOM_NODE_LIMIT) return;
+            try { for (const picture of root.querySelectorAll('picture')) pictures.push(picture); } catch (error) {}
+            try {
+              for (const link of root.querySelectorAll('link[media]')) {
+                dom.visited += 1;
+                if (dom.visited >= DOM_NODE_LIMIT) { dom.limitReached = true; return; }
+                links.push(link);
+              }
+            } catch (error) {}
+          };
+          const walk = (root) => {
+            scanRoot(root);
+            if (dom.visited >= DOM_NODE_LIMIT) return;
+            let elements;
+            try { elements = root.querySelectorAll('*'); } catch (error) { return; }
+            for (const el of elements) {
+              dom.visited += 1;
+              if (dom.visited >= DOM_NODE_LIMIT) { dom.limitReached = true; return; }
+              if (el && el.shadowRoot) walk(el.shadowRoot);
+            }
+          };
+          try { walk(document); } catch (error) {}
+          for (const picture of pictures) {
+            const img = (() => { try { return picture.querySelector('img'); } catch (error) { return undefined; } })();
+            if (!img || typeof img.getAttribute !== 'function' || typeof img.setAttribute !== 'function') continue;
+            const sources = [];
+            try { for (const source of picture.querySelectorAll('source')) sources.push(source); } catch (error) {}
+            const chosen = chooseSource(sources);
+            let nextSrcset;
+            let nextSrc;
+            if (chosen !== undefined) {
+              try {
+                const sourceSrcset = chosen.getAttribute('srcset');
+                const sourceSrc = chosen.getAttribute('src');
+                nextSrcset = typeof sourceSrcset === 'string' && sourceSrcset.trim() !== '' ? sourceSrcset : undefined;
+                nextSrc = nextSrcset === undefined && typeof sourceSrc === 'string' && sourceSrc.trim() !== '' ? sourceSrc : undefined;
+              } catch (error) { continue; }
+              if (nextSrcset === undefined && nextSrc === undefined) continue;
+            } else {
+              // No <source> matches the emulated scheme (e.g. only a dark
+              // source on a dark-OS machine): fall back to the img's own src,
+              // which is how a light-preferring browser would render it.
+              try {
+                const fallback = img.getAttribute('src');
+                if (typeof fallback !== 'string' || fallback.trim() === '') continue;
+                nextSrc = fallback;
+              } catch (error) { continue; }
+            }
+            let saved;
+            try {
+              saved = { img, srcset: img.getAttribute('srcset'), src: img.getAttribute('src'), sources: [] };
+            } catch (error) { continue; }
+            // Neutralise every <source>: while a source's media matches the
+            // REAL browser preference it overrides the img's own src/srcset,
+            // so the emulated variant could never win (the exact bug seen on a
+            // dark-OS machine). Restoring the media values re-arms them.
+            for (const source of sources) {
+              let media = null;
+              try { media = source.getAttribute('media'); } catch (error) { media = null; }
+              saved.sources.push({ el: source, media });
+              try { source.setAttribute('media', 'not all'); } catch (error) {}
+            }
+            if (nextSrcset !== undefined) {
+              setOrRemove(img, 'srcset', nextSrcset);
+              setOrRemove(img, 'src', saved.src);
+            } else {
+              setOrRemove(img, 'srcset', undefined);
+              setOrRemove(img, 'src', nextSrc);
+            }
+            state.pictures.push(saved);
+            dom.picturesPatched += 1;
+          }
+          for (const link of links) {
+            let media = null;
+            try { media = link.getAttribute('media'); } catch (error) { continue; }
+            const text = String(media ?? '');
+            if (!COLOR_SCHEME.test(text)) continue;
+            if (typeof link.setAttribute !== 'function') continue;
+            const verdict = evaluateMedia(text);
+            setOrRemove(link, 'media', verdict === true ? 'all' : 'not all');
+            state.links.push({ link, media: text });
+            dom.linkMediaPatched += 1;
+          }
+          return dom;
+        };
+        const restoredDomCount = restoreDomPatches();
         const restoredCount = state.patched.length;
         for (const entry of state.patched) {
           try { entry.rule.media.mediaText = entry.original; } catch (error) {}
@@ -794,15 +966,25 @@ window.__ModuleLoader__.load({
             for (const rule of Array.from(rules)) normalizeRule(rule);
           }
         };
+        let domResult;
+        const rescan = () => {
+          scan();
+          if (SCHEME === 'light' || SCHEME === 'dark') {
+            // Restore then re-patch: late-added pictures/links get picked and
+            // the counters stay per-call.
+            restoreDomPatches();
+            domResult = patchDom();
+          }
+        };
         if (SCHEME === 'light' || SCHEME === 'dark') {
           state.scheme = SCHEME;
           if (document.documentElement && document.documentElement.style) document.documentElement.style.colorScheme = SCHEME;
-          scan();
+          rescan();
           if (typeof MutationObserver === 'function' && document.documentElement) {
             if (!state.observer) {
               state.observer = new MutationObserver(() => {
                 if (state.scanTimer) return;
-                state.scanTimer = setTimeout(() => { state.scanTimer = undefined; scan(); }, 120);
+                state.scanTimer = setTimeout(() => { state.scanTimer = undefined; rescan(); }, 120);
               });
               state.observer.observe(document.documentElement, { subtree: true, childList: true });
             }
@@ -810,7 +992,7 @@ window.__ModuleLoader__.load({
           if (!state.poll) {
             let remaining = 20;
             state.poll = setInterval(() => {
-              scan();
+              rescan();
               remaining -= 1;
               if (remaining <= 0) { clearInterval(state.poll); state.poll = undefined; }
             }, 500);
@@ -834,6 +1016,13 @@ window.__ModuleLoader__.load({
           colorScheme: document.documentElement && document.documentElement.style ? String(document.documentElement.style.colorScheme || '') : null,
           sheets,
           mediaRules: { patched: sheets.patched, restored: restoredCount },
+          dom: {
+            picturesPatched: domResult?.picturesPatched ?? 0,
+            linkMediaPatched: domResult?.linkMediaPatched ?? 0,
+            restored: restoredDomCount,
+            visited: domResult?.visited ?? 0,
+            limitReached: domResult?.limitReached === true,
+          },
           verified: {
             darkMatches: verify('(prefers-color-scheme: dark)'),
             lightMatches: verify('(prefers-color-scheme: light)')
@@ -1053,7 +1242,9 @@ window.__ModuleLoader__.load({
       const consoleLimit = options.consoleLimit ?? 200;
       const evaluateResultLimit = options.evaluateResultLimit ?? 200 * 1024;
       const fullPageMaxCssPx = options.fullPageMaxCssPx ?? 12000;
-      const captureTimeoutMs = options.captureTimeoutMs ?? 12000;
+      const captureTimeoutMs = options.captureTimeoutMs ?? 8000;
+      const decodeTimeoutMs = options.decodeTimeoutMs ?? 1500;
+      const fullPageBudgetMs = options.fullPageBudgetMs ?? 60000;
       const viewportSettleMs = options.viewportSettleMs ?? 2000;
 
       let webview;
@@ -1069,6 +1260,8 @@ window.__ModuleLoader__.load({
       let viewportState;
       /** Current best-effort prefers-color-scheme emulation: light/dark/auto. */
       let themeState = "auto";
+      /** Page-scrollbar preference for viewport captures: "auto" (default) or "hidden". */
+      let scrollbarState = "auto";
       let lastNavigation = { url: "", title: "" };
       /** Ring buffer of webview console-message events (≤ consoleLimit). */
       const consoleLog = [];
@@ -1227,6 +1420,7 @@ window.__ModuleLoader__.load({
         mountContainer = undefined;
         viewportState = undefined;
         themeState = "auto";
+        scrollbarState = "auto";
         lastNavigation = { url: "", title: "" };
         consoleLog.length = 0;
         consoleCounts.error = 0;
@@ -1402,6 +1596,7 @@ window.__ModuleLoader__.load({
           innerWidth: Math.round(Number(info?.innerWidth ?? 0)),
           innerHeight: Math.round(Number(info?.innerHeight ?? 0)),
           devicePixelRatio: Number(info?.devicePixelRatio ?? 1),
+          contentWidth: Math.round(Number(info?.contentWidth ?? 0)),
           scrollWidth: Math.round(Number(info?.scrollWidth ?? 0)),
           scrollHeight: Math.round(Number(info?.scrollHeight ?? 0)),
         };
@@ -1438,7 +1633,36 @@ window.__ModuleLoader__.load({
         return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
       }
 
-      /** Draw stitched viewport captures into one canvas and encode it. */
+      /**
+       * Decode one captured image with a hard bound. In the real renderer both
+       * `Image.decode()` and the load/error events can stall (huge data URLs,
+       * memory pressure), and an unbounded decode wedges the whole capture:
+       * race decode() against the load event and a timeout that throws with
+       * the phase label so the stage diagnostics show where it hung.
+       */
+      function decodeSegmentImage(image, label, timeoutMs) {
+        const loadEvent = new Promise((resolve, reject) => {
+          image.onload = () => resolve();
+          image.onerror = () => reject(new Error(`${label}: the captured image could not be decoded`));
+        });
+        const decodeCall =
+          typeof image.decode === "function"
+            ? Promise.resolve(image.decode()).catch((error) => {
+                throw error;
+              })
+            : loadEvent;
+        let timer;
+        const timeout = new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label}: image decode timed out after ${timeoutMs}ms`)), timeoutMs);
+        });
+        return Promise.race([decodeCall, loadEvent, timeout]).finally(() => clearTimeout(timer));
+      }
+
+      /**
+       * Draw stitched viewport captures into one canvas and encode it.
+       * Segments may override draw geometry (dx/dy/dw/dh) so the tall-element
+       * path reuses this same canvas + decode + encode base.
+       */
       async function stitchSegments(segments, width, height, viewportHeight, format, quality) {
         const canvas = documentRef.createElement("canvas");
         canvas.width = Math.max(1, Math.round(width));
@@ -1449,17 +1673,18 @@ window.__ModuleLoader__.load({
         }
         const ImageCtor = globalThis.Image;
         if (typeof ImageCtor !== "function") throw new Error("fullPage screenshot needs the renderer Image constructor");
-        for (const segment of segments) {
+        for (let index = 0; index < segments.length; index += 1) {
+          const segment = segments[index];
           const image = new ImageCtor();
           image.src = segment.dataUrl;
-          if (typeof image.decode === "function") await image.decode();
-          else {
-            await new Promise((resolve, reject) => {
-              image.onload = resolve;
-              image.onerror = () => reject(new Error("a fullPage capture segment could not be decoded"));
-            });
-          }
-          context.drawImage(image, 0, segment.actualY, Math.round(width), Math.round(viewportHeight));
+          await decodeSegmentImage(image, segment.decodeLabel ?? "fullPage stitch", decodeTimeoutMs);
+          context.drawImage(
+            image,
+            Math.round(segment.dx ?? 0),
+            Math.round(segment.dy ?? segment.actualY ?? 0),
+            Math.round(segment.dw ?? width),
+            Math.round(segment.dh ?? viewportHeight),
+          );
         }
         const dataUrl =
           format === "jpeg"
@@ -1480,23 +1705,59 @@ window.__ModuleLoader__.load({
        * implementation scrolls viewport by viewport, captures normal-sized
        * frames, and stitches them in a canvas: no guest resize, no vh reflow.
        * Cost: position:fixed/sticky elements repeat in the output (documented).
+       *
+       * 0.2.4 hardening after a real-device finding (2026-10-27): local pages
+       * finished in seconds but external pages (github.com, wikipedia.org)
+       * reliably hit the 25s bridge timeout. Regular viewport screenshots on
+       * the same pages were instant and manual hide+scroll+capture worked, so
+       * the hang lives in the stitch/restore path, not capturePage. Every
+       * await here is now bounded (capture, decode, every executeJavaScript,
+       * the restore steps), the whole capture has a total budget, and every
+       * stage posts a `fullpage` diagnostic so the next device run shows which
+       * step stalled on which page.
        */
       async function captureFullPage(current, options = {}) {
         if (typeof current.capturePage !== "function") throw new Error("capturePage is not available in this webview");
         const format = options.format === "jpeg" ? "jpeg" : "png";
         const quality = options.quality;
+        const startedAt = Date.now();
+        const stage = (phase, extra) => {
+          void postDiag("fullpage", {
+            phase,
+            ms: Date.now() - startedAt,
+            ...(extra === undefined ? {} : extra),
+          });
+        };
+        const budgetLeft = () => fullPageBudgetMs <= 0 || Date.now() - startedAt < fullPageBudgetMs;
+        const budgetError = () =>
+          new Error(
+            `fullPage screenshot exceeded its ${fullPageBudgetMs}ms budget: ${timings.segments} segment(s) captured in ${Date.now() - startedAt}ms`,
+          );
         let scrollbarsHidden = false;
         let originalScrollY = 0;
+        const timings = { segments: 0, captureMs: [], encodeMs: [] };
+        stage("begin");
         try {
           // Hide scrollbars first: the layout width grows by the scrollbar
-          // width, so dimensions must be read after it is applied.
+          // width, so dimensions must be read after it is applied. Never run
+          // unbounded: a stalled hide would wedge stitching a step later.
           try {
-            const hidden = await current.executeJavaScript(scrollbarVisibilityJs(true));
+            const hidden = await withCaptureTimeout(
+              Promise.resolve(current.executeJavaScript(scrollbarVisibilityJs(true))),
+              captureTimeoutMs,
+              "fullPage hideScrollbars",
+            );
             scrollbarsHidden = hidden?.hidden === true;
-          } catch {
+          } catch (error) {
             scrollbarsHidden = false;
+            void postDiag("fullpage", {
+              phase: "hide-scrollbars-failed",
+              ms: Date.now() - startedAt,
+              error: String(error && error.message ? error.message : error),
+            });
           }
           if (scrollbarsHidden) await sleepImpl(60);
+          stage("hideScrollbars");
           const state = await current.executeJavaScript(scrollStateJs());
           const viewport = await current.executeJavaScript(viewportInfoJs());
           const requestedHeight = Math.max(1, Math.round(Number(state?.scrollHeight ?? 0)));
@@ -1507,20 +1768,47 @@ window.__ModuleLoader__.load({
           const segments = [];
           let targetY = 0;
           while (targetY < capturedHeight) {
+            if (!budgetLeft()) throw budgetError();
+            stage("segment-start", { index: segments.length });
             // `behavior: 'instant'` bypasses a page's `scroll-behavior: smooth`,
             // which would otherwise animate and make the capture frame lag.
-            await current.executeJavaScript(`(() => { window.scrollTo({ top: ${targetY}, left: 0, behavior: 'instant' }); return 1; })()`);
+            await withCaptureTimeout(
+              Promise.resolve(current.executeJavaScript(`(() => { window.scrollTo({ top: ${targetY}, left: 0, behavior: 'instant' }); return 1; })()`)),
+              captureTimeoutMs,
+              "fullPage scrollTo",
+            );
             await sleepImpl(60);
+            const captureStartedAt = Date.now();
+            stage("segment-capture", { index: segments.length });
             const image = await withCaptureTimeout(Promise.resolve(current.capturePage()), captureTimeoutMs, "capturePage");
+            timings.captureMs.push(Date.now() - captureStartedAt);
             // The browser clamps a scroll near the bottom; record where the
             // frame really starts so the stitched output stays aligned.
-            const at = await current.executeJavaScript(scrollStateJs());
+            const at = await withCaptureTimeout(
+              Promise.resolve(current.executeJavaScript(scrollStateJs())),
+              captureTimeoutMs,
+              "fullPage scrollState",
+            );
             const actualY = Math.max(0, Math.round(Number(at?.scrollY ?? targetY)));
-            segments.push({ actualY, dataUrl: await imageToDataUrl(image, "png", 100) });
+            const encodeStartedAt = Date.now();
+            const dataUrl = await imageToDataUrl(image, "png", 100);
+            timings.encodeMs.push(Date.now() - encodeStartedAt);
+            stage("segment-encode", { index: segments.length, stepMs: Date.now() - encodeStartedAt });
+            segments.push({ actualY, dataUrl });
             if (actualY >= capturedHeight - viewportHeight) break;
             targetY += viewportHeight;
           }
-          const dataUrl = await stitchSegments(segments, viewportWidth, capturedHeight, viewportHeight, format, quality);
+          if (!budgetLeft()) throw budgetError();
+          timings.segments = segments.length;
+          stage("stitch", { index: segments.length });
+          const dataUrl = await stitchSegments(
+            segments.map((segment) => ({ ...segment, dy: segment.actualY, dh: Math.min(viewportHeight, capturedHeight - segment.actualY) })),
+            viewportWidth,
+            capturedHeight,
+            viewportHeight,
+            format,
+            quality,
+          );
           return {
             dataUrl,
             format,
@@ -1532,18 +1820,227 @@ window.__ModuleLoader__.load({
               stitched: true,
               viewportHeight,
               scrollbarsHidden,
+              timings: {
+                // Total wall time including capture, stitch and restore.
+                totalMs: Date.now() - startedAt,
+                segments: segments.length,
+                captureMs: [...timings.captureMs],
+                encodeMs: [...timings.encodeMs],
+              },
             },
             viewportInfo: { innerWidth: viewportWidth, innerHeight: viewportHeight },
           };
+        } catch (error) {
+          void postDiag("fullpage", {
+            phase: "error",
+            ms: Date.now() - startedAt,
+            error: String(error && error.message ? error.message : error),
+          });
+          throw error;
         } finally {
+          // Bounded restore too: a wedged guest must not keep the command loop
+          // waiting past the capture itself.
           try {
-            await current.executeJavaScript(`(() => { window.scrollTo({ top: ${originalScrollY}, left: 0, behavior: 'instant' }); return 1; })()`);
+            await withCaptureTimeout(
+              Promise.resolve(current.executeJavaScript(`(() => { window.scrollTo({ top: ${originalScrollY}, left: 0, behavior: 'instant' }); return 1; })()`)),
+              Math.min(captureTimeoutMs, 2500),
+              "fullPage scroll restore",
+            );
           } catch {
             // The page may have navigated away mid-capture.
           }
           if (scrollbarsHidden) {
             try {
-              await current.executeJavaScript(scrollbarVisibilityJs(false));
+              await withCaptureTimeout(
+                Promise.resolve(current.executeJavaScript(scrollbarVisibilityJs(false))),
+                Math.min(captureTimeoutMs, 2500),
+                "fullPage scrollbar restore",
+              );
+            } catch {
+              // The page may have navigated away mid-capture.
+            }
+          }
+          stage("restore");
+        }
+      }
+
+      /**
+       * Tall-element screenshot: scroll-stitch an element that is taller than
+       * the viewport (or lies outside it) instead of clipping it to the first
+       * screen. Shares the fullPage base (scrollbar hide/restore, per-segment
+       * capture, canvas stitch) but crops to the element's box and reports its
+       * own receipt fields; the total height keeps the same 12000 CSS px cap.
+       */
+      async function captureTallElement(current, target, options = {}) {
+        const format = options.format === "jpeg" ? "jpeg" : "png";
+        const quality = options.quality;
+        const startedAt = Date.now();
+        const stage = (phase, extra) => {
+          void postDiag("fullpage", {
+            phase: `element-${phase}`,
+            ms: Date.now() - startedAt,
+            ...(extra === undefined ? {} : extra),
+          });
+        };
+        const budgetLeft = () => fullPageBudgetMs <= 0 || Date.now() - startedAt < fullPageBudgetMs;
+        const viewport = target.viewport ?? {};
+        const innerWidth = Math.max(1, Math.round(Number(viewport.width ?? target.innerWidth ?? 0)));
+        const innerHeight = Math.max(1, Math.round(Number(viewport.height ?? target.innerHeight ?? 0)));
+        const full = target.full ?? {};
+        // Page-space coordinates: scrollbars are hidden (and page-wide
+        // scrollTo uses left:0), so viewport coordinates taken at measure time
+        // are not stable; page coordinates are.
+        const fullX = Math.round(Number(full.x ?? target.rect?.x ?? 0));
+        const fullY = Math.round(Number(full.y ?? target.rect?.y ?? 0));
+        const fullWidth = Math.max(1, Math.round(Number(full.width ?? target.rect?.width ?? 1)));
+        const fullHeight = Math.max(1, Math.round(Number(full.height ?? target.rect?.height ?? 1)));
+        const capped = fullHeight > fullPageMaxCssPx;
+        const captureHeight = Math.max(1, Math.min(fullHeight, fullPageMaxCssPx));
+        // Crop to the visible horizontal band of the element; the over-wide
+        // remainder is reported instead of faked.
+        const cropLeft = Math.max(0, fullX);
+        const cropWidth = Math.max(1, Math.min(fullX + fullWidth, innerWidth) - cropLeft);
+        let scrollbarsHidden = false;
+        /** Scroll position to restore in the finally block (measured pre-capture). */
+        let originalScrollY = 0;
+        const timings = { segments: 0, captureMs: [], encodeMs: [] };
+        stage("begin");
+        try {
+          try {
+            const hidden = await withCaptureTimeout(
+              Promise.resolve(current.executeJavaScript(scrollbarVisibilityJs(true))),
+              captureTimeoutMs,
+              "tall element hideScrollbars",
+            );
+            scrollbarsHidden = hidden?.hidden === true;
+          } catch (error) {
+            scrollbarsHidden = false;
+            void postDiag("fullpage", {
+              phase: "element-hide-scrollbars-failed",
+              ms: Date.now() - startedAt,
+              error: String(error && error.message ? error.message : error),
+            });
+          }
+          if (scrollbarsHidden) await sleepImpl(60);
+          stage("hideScrollbars");
+          let originalScrollAtCapture = 0;
+          try {
+            const initial = await current.executeJavaScript(scrollStateJs());
+            originalScrollAtCapture = Math.max(0, Math.round(Number(initial?.scrollY ?? 0)));
+          } catch {
+            originalScrollAtCapture = 0;
+          }
+          originalScrollY = originalScrollAtCapture;
+          const segments = [];
+          let offset = 0;
+          let covered = 0;
+          let lastCovered = -1;
+          while (covered < captureHeight) {
+            if (!budgetLeft()) {
+              throw new Error(
+                `tall element screenshot exceeded its ${fullPageBudgetMs}ms budget: ${segments.length} segment(s) captured covering ${covered} of ${captureHeight} px`,
+              );
+            }
+            stage("segment-start", { index: segments.length });
+            await withCaptureTimeout(
+              Promise.resolve(current.executeJavaScript(`(() => { window.scrollTo({ top: ${fullY + offset}, left: 0, behavior: 'instant' }); return 1; })()`)),
+              captureTimeoutMs,
+              "tall element scrollTo",
+            );
+            await sleepImpl(60);
+            const captureStartedAt = Date.now();
+            stage("segment-capture", { index: segments.length });
+            const at = await withCaptureTimeout(
+              Promise.resolve(current.executeJavaScript(scrollStateJs())),
+              captureTimeoutMs,
+              "tall element scrollState",
+            );
+            const actualY = Math.max(0, Math.round(Number(at?.scrollY ?? fullY + offset)));
+            // Element top in viewport coordinates at this scroll position.
+            const elementTop = fullY - actualY;
+            const rectTop = Math.max(0, elementTop);
+            const rectBottom = Math.min(elementTop + fullHeight, innerHeight);
+            const rectHeight = rectBottom - rectTop;
+            if (rectHeight <= 0) break;
+            const image = await withCaptureTimeout(
+              Promise.resolve(current.capturePage({ x: cropLeft, y: rectTop, width: cropWidth, height: rectHeight })),
+              captureTimeoutMs,
+              "capturePage",
+            );
+            timings.captureMs.push(Date.now() - captureStartedAt);
+            const encodeStartedAt = Date.now();
+            const dataUrl = await imageToDataUrl(image, "png", 100);
+            timings.encodeMs.push(Date.now() - encodeStartedAt);
+            stage("segment-encode", { index: segments.length, stepMs: Date.now() - encodeStartedAt });
+            segments.push({ dx: cropLeft, dy: Math.max(0, rectTop - elementTop), dw: cropWidth, dh: rectHeight, dataUrl, decodeLabel: "tall element stitch" });
+            covered = Math.max(covered, Math.max(0, rectTop - elementTop) + rectHeight);
+            if (covered <= lastCovered || actualY >= fullY + captureHeight - innerHeight) break;
+            lastCovered = covered;
+            offset = covered;
+          }
+          if (!budgetLeft() && segments.length === 0) {
+            throw new Error(
+              `tall element screenshot exceeded its ${fullPageBudgetMs}ms budget: ${segments.length} segment(s) captured covering ${covered} of ${captureHeight} px`,
+            );
+          }
+          if (segments.length === 0) {
+            throw new Error("tall element screenshot produced no segment; the element is not visible at any scroll position");
+          }
+          timings.segments = segments.length;
+          stage("stitch", { index: segments.length });
+          const dataUrl = await stitchSegments(segments, cropWidth, captureHeight, innerHeight, format, quality);
+          stage("restore");
+          return {
+            dataUrl,
+            format,
+            element: {
+              target: target.target,
+              clippedToViewport: false,
+              stitched: true,
+              segments: segments.length,
+              fullRect: { x: fullX, y: fullY, width: fullWidth, height: fullHeight },
+              fullHeight,
+              fullWidth,
+              capturedHeight: captureHeight,
+              capped,
+              croppedWidth: Math.max(0, fullWidth - cropWidth),
+              viewportHeight: innerHeight,
+              scrollbarsHidden,
+              timings: {
+                totalMs: Date.now() - startedAt,
+                segments: segments.length,
+                captureMs: [...timings.captureMs],
+                encodeMs: [...timings.encodeMs],
+              },
+            },
+            viewport: { width: innerWidth, height: innerHeight },
+          };
+        } catch (error) {
+          void postDiag("fullpage", {
+            phase: "element-error",
+            ms: Date.now() - startedAt,
+            error: String(error && error.message ? error.message : error),
+          });
+          throw error;
+        } finally {
+          try {
+            await withCaptureTimeout(
+              Promise.resolve(
+                current.executeJavaScript(`(() => { window.scrollTo({ top: ${originalScrollY}, left: 0, behavior: 'instant' }); return 1; })()`),
+              ),
+              Math.min(captureTimeoutMs, 2500),
+              "tall element scroll restore",
+            );
+          } catch {
+            // The page may have navigated away mid-capture.
+          }
+          if (scrollbarsHidden) {
+            try {
+              await withCaptureTimeout(
+                Promise.resolve(current.executeJavaScript(scrollbarVisibilityJs(false))),
+                Math.min(captureTimeoutMs, 2500),
+                "tall element scrollbar restore",
+              );
             } catch {
               // The page may have navigated away mid-capture.
             }
@@ -1563,17 +2060,37 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** Replay the persistent scrollbar-hide style after the document changed. */
+      async function replayScrollbars(current) {
+        if (scrollbarState !== "hidden") return false;
+        try {
+          await current.executeJavaScript(scrollbarVisibilityJs(true));
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
       /** Navigation invalidates the in-page cursor/refs; replay emulation if set. */
       async function afterNavigation(current, info, fallbackUrl) {
         lastSnapshot = undefined;
         lastNavigation = { url: info.url || fallbackUrl || "", title: info.title || "" };
         await replayTheme(current);
+        await replayScrollbars(current);
       }
 
       /**
        * Ensure the panel exists and its webview is ready, reopening a released
        * guest when needed. Shared by open/navigate so a navigate can be the
        * first call (qa, agent shortcuts) instead of failing on a closed panel.
+       *
+       * Stale-panel recovery (0.2.4): after a DSH restart the sidebar can keep
+       * a webview that exists but never fires dom-ready (status showed
+       * hasWebview:true / client.ready:false). close→open fixed it by hand, so
+       * the first waitReady failure unmounts the stale guest and remounts once
+       * (unmount keeps lastMountContainer for exactly this), then waits again.
+       * If that still fails the floating-panel fallback runs; the final error
+       * carries the original message plus a close/open recovery hint.
        */
       async function ensurePanelReady() {
         if (ready) return;
@@ -1587,15 +2104,64 @@ window.__ModuleLoader__.load({
             void postDiag("panel", { phase: "reopen-mount-failed", error: String(error && error.message ? error.message : error) });
           }
         }
+        let firstError;
         try {
           await waitReady(2500);
-        } catch {
+          return;
+        } catch (error) {
+          firstError = error;
+        }
+        void postDiag("panel", { phase: "ready-stale", error: String(firstError && firstError.message ? firstError.message : firstError) });
+        // Stale guest: unmount the wedged webview and remount exactly one more
+        // time into the kept container before giving up.
+        let remounted = false;
+        if (lastMountContainer !== undefined) {
+          try {
+            unmount();
+            await ensureMounted(lastMountContainer);
+            remounted = true;
+          } catch (error) {
+            void postDiag("panel", { phase: "stale-remount-failed", error: String(error && error.message ? error.message : error) });
+          }
+        }
+        if (remounted) {
+          try {
+            await waitReady(2500);
+            void postDiag("panel", { phase: "stale-remounted" });
+            return;
+          } catch (error) {
+            firstError = error;
+          }
+        }
+        try {
           // The DSH right sidebar can keep a stale tab entry that never mounts
           // its body after plugin reloads; fall back to a floating panel so the
           // tool stays usable.
           await ensureFallbackMounted();
           await waitReady();
+        } catch {
+          throw new Error(
+            `Agent Browser panel did not become ready in time (${String(firstError && firstError.message ? firstError.message : firstError)}); ` +
+              "close the Agent Browser tab and call action=open again (or ask the user to reopen the panel)",
+          );
         }
+      }
+
+      /**
+       * Decide whether an element screenshot must scroll-stitch instead of
+       * clipping to the viewport: the element is taller than the viewport or
+       * extends outside the visible band measured by screenshotTargetJs.
+       */
+      function elementStitchPlan(target) {
+        if (!target || target.ok !== true || !target.full || !target.viewport) return undefined;
+        const viewportHeight = Math.max(1, Math.round(Number(target.viewport.height ?? 0)));
+        const scrollY = Math.max(0, Math.round(Number(target.scrollY ?? 0)));
+        const top = Math.round(Number(target.full.y ?? 0));
+        const height = Math.round(Number(target.full.height ?? 0));
+        if (!Number.isFinite(height) || height <= 0) return undefined;
+        const visibleTop = top - scrollY;
+        const runsOutside = height > viewportHeight || visibleTop < 0 || visibleTop + height > viewportHeight;
+        return runsOutside ? { stitch: true } : undefined;
       }
 
       async function handle(command) {
@@ -1911,20 +2477,61 @@ window.__ModuleLoader__.load({
           }
           case "viewport": {
             const current = await requireReady();
+            const scrollbars = command.scrollbars === "hidden" ? "hidden" : "auto";
             if (command.reset === true) {
+              if (scrollbarState === "hidden") {
+                // The persistent scrollbar-hide style must not outlive the
+                // auto (reset) viewport choice.
+                try {
+                  await current.executeJavaScript(scrollbarVisibilityJs(false));
+                } catch {
+                  // Best effort; receipt reports the outcome of the size below.
+                }
+              }
+              scrollbarState = "auto";
               viewportState = undefined;
               applyViewportStyle(undefined);
               const settled = await settleViewport(current, panelSize());
-              return { ok: true, reset: true, width: settled.actual.innerWidth, height: settled.actual.innerHeight, actual: settled.actual, matched: settled.matched, settledMs: settled.settledMs };
+              return {
+                ok: true,
+                reset: true,
+                width: settled.actual.innerWidth,
+                height: settled.actual.innerHeight,
+                actual: settled.actual,
+                matched: settled.matched,
+                settledMs: settled.settledMs,
+                contentWidth: settled.actual.contentWidth,
+                scrollbars: "auto",
+              };
             }
             const width = Math.max(64, Math.min(10000, Math.round(Number(command.width))));
             const height = Math.max(64, Math.min(10000, Math.round(Number(command.height ?? 800))));
             if (!Number.isFinite(width) || !Number.isFinite(height)) throw new Error("viewport requires numeric width and height");
+            if (scrollbars === "hidden") {
+              // Same hide-scrollbar injection the fullPage stitch uses, but
+              // persistent: replayed after navigation until reset/close.
+              await current.executeJavaScript(scrollbarVisibilityJs(true));
+              scrollbarState = "hidden";
+            } else if (scrollbarState === "hidden") {
+              await current.executeJavaScript(scrollbarVisibilityJs(false));
+              scrollbarState = "auto";
+            }
             const scale = computeScale(width, height);
             viewportState = { width, height, scale };
             applyViewportStyle(viewportState);
             const settled = await settleViewport(current, { width, height });
-            return { ok: true, width, height, scale, actual: settled.actual, matched: settled.matched, settledMs: settled.settledMs, panel: panelSize() };
+            return {
+              ok: true,
+              width,
+              height,
+              scale,
+              actual: settled.actual,
+              matched: settled.matched,
+              settledMs: settled.settledMs,
+              contentWidth: settled.actual.contentWidth,
+              scrollbars,
+              panel: panelSize(),
+            };
           }
           case "logs": {
             const current = await requireReady();
@@ -2029,19 +2636,20 @@ window.__ModuleLoader__.load({
             let elementInfo;
             let clipInfo;
             let viewportInfo;
+            let screenshotTargetResult;
             if (command.ref !== undefined || command.selector !== undefined) {
-              const target = await current.executeJavaScript(
+              screenshotTargetResult = await current.executeJavaScript(
                 screenshotTargetJs({
                   ...(command.ref === undefined || command.ref === null ? {} : { ref: String(command.ref) }),
                   ...(typeof command.selector === "string" && command.selector !== "" ? { selector: command.selector } : {}),
                 }),
               );
-              if (target === undefined || target === null || target.ok !== true) {
-                throw new Error(target?.error ?? "screenshot target not found; take a snapshot first");
+              if (screenshotTargetResult === undefined || screenshotTargetResult === null || screenshotTargetResult.ok !== true) {
+                throw new Error(screenshotTargetResult?.error ?? "screenshot target not found; take a snapshot first");
               }
-              rect = target.rect;
-              viewportInfo = target.viewport;
-              elementInfo = { target: target.target, clippedToViewport: target.clipped === true };
+              rect = screenshotTargetResult.rect;
+              viewportInfo = screenshotTargetResult.viewport;
+              elementInfo = { target: screenshotTargetResult.target, clippedToViewport: screenshotTargetResult.clipped === true };
               mode = "element";
             } else if (command.clip !== undefined && command.clip !== null) {
               viewportInfo = await current.executeJavaScript(viewportInfoJs());
@@ -2078,6 +2686,23 @@ window.__ModuleLoader__.load({
                     width: stitched.viewportInfo.innerWidth,
                     height: stitched.viewportInfo.innerHeight,
                   },
+                  devicePixelRatio: undefined,
+                  hideCursor,
+                };
+              }
+              if (mode === "element" && elementStitchPlan(screenshotTargetResult) !== undefined) {
+                // An element taller than the viewport (or lying outside it) is
+                // scroll-stitched instead of clipped to the first screen;
+                // shares the fullPage stitch base with its own receipt fields.
+                if (typeof current.capturePage !== "function") throw new Error("capturePage is not available in this webview");
+                const stitched = await captureTallElement(current, screenshotTargetResult, { format, quality });
+                return {
+                  ok: true,
+                  dataUrl: stitched.dataUrl,
+                  format,
+                  mode,
+                  element: stitched.element,
+                  viewport: stitched.viewport,
                   devicePixelRatio: undefined,
                   hideCursor,
                 };
@@ -2240,12 +2865,30 @@ window.__ModuleLoader__.load({
               } catch (error) {
                 result = { ok: false, error: String(error && error.message ? error.message : error) };
               }
-              await fetch(`${BASE}/result?id=${encodeURIComponent(message.id)}`, {
+              let payload = JSON.stringify(result);
+              // The bridge rejects oversized result bodies (HTTP 413) and the
+              // Host would only see a timeout. Fail loudly with guidance first.
+              if (payload.length > MAX_RESULT_CHARS) {
+                result = {
+                  ok: false,
+                  error: `result too large for the bridge (${payload.length} chars; limit ${MAX_RESULT_CHARS}) — retry with format "jpeg", a smaller clip/viewport, or a shorter fullPage`,
+                };
+                payload = JSON.stringify(result);
+              }
+              const posted = await fetch(`${BASE}/result?id=${encodeURIComponent(message.id)}`, {
                 method: "POST",
                 headers: authHeaders({ "content-type": "application/json" }),
-                body: JSON.stringify(result),
+                body: payload,
                 signal: fetchSignal(lifetime, 4000),
               });
+              if (!posted.ok) {
+                void postDiag("panel", {
+                  phase: "result-rejected",
+                  id: message.id,
+                  status: posted.status,
+                  chars: payload.length,
+                });
+              }
             } else {
               // The Host answers immediately only for a stale client instance;
               // do not busy-loop on it.

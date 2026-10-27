@@ -10,7 +10,9 @@ QA 验收动作（viewport / evaluate / metrics / wait / logs / 主题模拟 / f
 dsh plugin --profile desktop add github:Dax233/dsh-sidebar-browser-control
 ```
 
-安装后重启 DSH Desktop；调用 `browser open` 会自动打开 Agent Browser 面板。
+安装后重启 DSH Desktop；调用 `browser open` 会自动打开 Agent Browser 面板。当面板存在但一直
+不 ready（如 DSH 重启后的 stale webview），`open`/`navigate` 会自动 unmount 并重挂一次；仍失败时
+给出 close/open 的恢复指引。
 
 ---
 
@@ -41,7 +43,7 @@ inside the page viewport.
 
 | action | arguments | meaning |
 |---|---|---|
-| `open` | `url` | show the sidebar panel and navigate (also reopens after `close`) |
+| `open` | `url` | show the sidebar panel and navigate (also reopens after `close`); recovers once from a stale never-ready panel by remounting |
 | `navigate` | `url` | navigate the panel, opening it first when it is closed |
 | `snapshot` | – | title/url/viewport + interactive elements with refs |
 | `click` | `ref` or `x,y` | move the virtual cursor, hit-test, dispatch real mouse input |
@@ -56,15 +58,15 @@ inside the page viewport.
 
 | action | arguments | meaning |
 |---|---|---|
-| `viewport` | `width`, `height` (default 800), `reset` | set the real guest CSS viewport (the panel scales to fit); receipt reports actual `innerWidth/innerHeight/devicePixelRatio` |
+| `viewport` | `width`, `height` (default 800), `reset`, `scrollbars` (`auto` default / `hidden`) | set the real guest CSS viewport (the panel scales to fit); `scrollbars:"hidden"` persistently hides the page scrollbars (content width == viewport width; replayed after navigation, removed by `reset`/`close`); receipt reports actual `innerWidth/innerHeight/devicePixelRatio/contentWidth` and explains the classic-scrollbar difference |
 | `evaluate` | `expression` | `executeJavaScript` wrapper; JSON result, Host receipt capped at 16KB |
 | `metrics` | `selectors[]`, `includeOverflow` | viewport/document sizes, content width, top-20 horizontal overflow, images (total/loaded/failed + src), `document.fonts.status`, console error/warning counts, per-selector rect/natural size |
 | `logs` | `clear`, `filter`, `limit` | console-message ring buffer (≤200) + page-side failed-image/resource probe |
-| `screenshot` | `fullPage`, `clip{x,y,width,height}`, `ref`, `selector`, `format` (`png`/`jpeg`), `quality`, `path`, `hideCursor` | saves PNG/JPEG evidence and reports the real pixel size parsed from the file; `fullPage` scroll-stitches viewport captures (≤12000 CSS px; fixed/sticky elements may repeat) |
-| `emulate` | `colorScheme` (`light`/`dark`/`auto`) | best-effort light/dark preference: matchMedia shim + same-origin `@media (prefers-color-scheme)` rewrite; replayed on navigation (open/navigate/click/key) |
+| `screenshot` | `fullPage`, `clip{x,y,width,height}`, `ref`, `selector`, `format` (`png`/`jpeg`), `quality`, `path`, `hideCursor` | saves PNG/JPEG evidence and reports the real pixel size parsed from the file; `fullPage` scroll-stitches viewport captures (≤12000 CSS px; fixed/sticky elements may repeat) and reports stage diagnostics, per-step `timings` and the segment count; an element taller than the viewport (or outside it) is scroll-stitched instead of clipped (≤12000, `capped`/`croppedWidth` annotated); every stitch step has a timeout; fullPage rides a longer bridge command timeout (default 120s, `DSH_BROWSER_CONTROL_FULLPAGE_TIMEOUT_MS`) |
+| `emulate` | `colorScheme` (`light`/`dark`/`auto`) | best-effort light/dark preference: matchMedia shim, same-origin `@media (prefers-color-scheme)` rewrite, plus a DOM fallback that re-picks native `<picture><source media>` and normalizes `<link rel=stylesheet media>` (including open shadow roots, capped at 6000 nodes); counters in the receipt; fully restored by `auto`; replayed on navigation (open/navigate/click/key) |
 | `setContent` | `html`, optional `baseUrl` | render self-contained HTML (inline CSS / `data:` URLs; max 2MB) |
 | `preview` | `dir` (absolute), optional `file`, `port` | serve a local directory over a tokenized 127.0.0.1 URL and open it |
-| `qa` | `url`, `widths`, `themes`, `height`, `fullPage`, `maxVariants`, `outDir`, `selectors` | one call runs the width × theme matrix (≤6 variants), saves one screenshot per variant, returns a compact table |
+| `qa` | `url`, `widths`, `themes`, `height`, `fullPage`, `scrollbars`, `maxVariants`, `outDir`, `selectors` | one call runs the width × theme matrix (≤6 variants); `scrollbars` is passed to every variant's viewport command; the result table reports viewport + content width; saves one screenshot per variant |
 | `close` | – | release the leased webview; `open` reopens |
 
 Only `http:` / `https:` navigation is allowed. The plugin never touches the
@@ -103,17 +105,60 @@ browser close
   scrolls one viewport at a time, captures normal-size frames, and stitches them
   in a canvas (cap 12000 CSS px, reported as `capped`). `vh` layouts are no longer
   distorted, but `position:fixed/sticky` elements can repeat in the stitched image.
-  Every `capturePage()` call is also bounded by a timeout, so a hanging capture
-  returns an error instead of freezing the panel.
+  Since round 2 (0.2.4): **every step is bounded** — each `capturePage`/decode/
+  scroll call races its own timeout (capture 8s, decode 1.5s), the whole capture
+  carries a 60s total budget (never hangs forever), every stage posts a
+  `fullpage` diagnostic to the bridge diag ring (`postDiag`), and the receipt
+  reports `timings` (total wall ms + per-segment capture/encode ms). The bridge
+  timeout for a fullPage command is 120s (`DSH_BROWSER_CONTROL_FULLPAGE_TIMEOUT_MS`)
+  so slow-but-healthy stitches survive the 25s default.
+  **Root cause found on the 2026-10-27 device run (fixed in 0.2.5):** the client
+  finished a github.com fullPage in 799ms (4 segments, per-segment capture 33–66ms),
+  but the bridge's `/result` handler rejected request bodies over 1 MB, and a real
+  site's full-page PNG base64 is several MB — the result was silently dropped and
+  the Host could only report a command timeout. A JPEG capture of the same page
+  (211 KB) succeeded in 669ms, which confirmed it. The bridge now accepts result
+  bodies up to 64 MB (`maxResultBodyBytes`), answers 413 and records
+  `lastRejectedBody` in the diag state when a body is too large, and the client
+  pre-checks the JSON payload (48 MB) so an oversized capture fails with an
+  actionable error ("use format jpeg / smaller clip") instead of a bare timeout.
+  For very long real pages prefer `format:"jpeg"` (much smaller) or a smaller
+  viewport width.
+- **Tall element screenshots are scroll-stitched too (0.2.4).** An element
+  taller than the viewport (or lying outside it) used to be clipped to the first
+  screen; it is now stitched from scroll captures into one image (cap 12000 CSS
+  px, `capped` annotated). Content wider than the viewport is cropped and the
+  receipt reports `croppedWidth` instead of faking it. `position:fixed/sticky`
+  repeats apply here as well.
+- **`viewport scrollbars:"hidden"` removes the classic scrollbar (0.2.4).**
+  The same hide-scrollbar CSS used by fullPage is injected persistently
+  (replayed after navigation; removed by `viewport reset` or `close`) so the
+  content width equals the viewport width. The receipt reports
+  `contentWidth` (`documentElement.clientWidth`) and explains the difference
+  when the guest uses a classic (non-overlay) scrollbar.
 - **Screenshots use the sandbox-safe image path.** The DSH renderer has no Node
   integration, so Electron's `nativeImage.toPNG()/toJPEG()` throw "Buffer is not
   available for the current Context". Capture conversion therefore prefers
   `toDataURL()`; JPEG falls back to re-encoding the PNG in a canvas when `toJPEG`
   is unavailable (0.2.2, found on a real tab).
 - **Theme `emulate` is best-effort, not CDP emulation.** It overrides
-  `matchMedia('(prefers-color-scheme: …)')` in the page and rewrites same-origin
-  media rules to `all`/`not all`. Cross-origin stylesheets are unreadable by
-  design (reported as `crossOrigin`); media rules that combine
+  `matchMedia('(prefers-color-scheme: …)')` in the page, rewrites same-origin
+  media rules to `all`/`not all`, and since 0.2.4 re-picks native
+  `<picture><source media="…prefers-color-scheme…">` and normalizes
+  `<link rel=stylesheet media="…">` in the DOM (including open shadow roots, up
+  to a 6000-node budget; counters in the receipt, full restore on `auto`).
+  Since 0.2.6 the picture patch also **neutralises every `<source media>` to
+  `not all`** while patched (restored on `auto`): the browser resolves
+  `<picture>` with the REAL preference, so on a dark-OS machine a dark
+  `<source>` would always override the img and a light emulation could never
+  win (found on a real probe page, where img attrs were correct but
+  `img.currentSrc` stayed dark). When no source matches the emulated scheme the
+  patch falls back to the img's own `src`.
+  Honest boundaries of that DOM fallback: pages that pick their image via
+  **JS runtime logic** (framework conditionals) still win over the patch,
+  **closed shadow DOM** is unreachable (`element.shadowRoot` is `null`), and
+  CSS `image-set()` variants are not rewritten. Cross-origin stylesheets remain
+  unreadable by design (reported as `crossOrigin`); media rules that combine
   `prefers-color-scheme` with other conditions are resolved at apply time, so
   resizing afterwards does not re-evaluate them; it is replayed on navigation
   (open/navigate, and click/key actions that replace the document).

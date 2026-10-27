@@ -30,6 +30,11 @@ const TOKEN = process.env.DSH_BROWSER_CONTROL_TOKEN ?? "dsh-browser-control-loca
 const STATE_FILE = process.env.DSH_BROWSER_CONTROL_STATE ?? join(tmpdir(), "dsh-browser-control-state.json");
 const COMMAND_TIMEOUT_MS = Number(process.env.DSH_BROWSER_CONTROL_COMMAND_TIMEOUT_MS ?? 25_000);
 const QA_COMMAND_TIMEOUT_MS = Number(process.env.DSH_BROWSER_CONTROL_QA_TIMEOUT_MS ?? 120_000);
+// fullPage screenshots scroll-stitch many viewport captures; on real external
+// pages this can legitimately run long, so the outgoing command gets its own
+// long bridge timeout (the client additionally bounds every internal step and
+// carries a 60s total budget so this mostly protects slow stitches).
+const FULLPAGE_SCREENSHOT_TIMEOUT_MS = Number(process.env.DSH_BROWSER_CONTROL_FULLPAGE_TIMEOUT_MS ?? 120_000);
 const SHOT_DIR = process.env.DSH_BROWSER_CONTROL_SHOT_DIR ?? join(tmpdir(), "dsh-browser-shots");
 
 const MAX_EVALUATE_BYTES = 16 * 1024;
@@ -67,8 +72,8 @@ const CLIENT_FRESH_MS = 60_000;
 
 const DESCRIPTION =
   "Drive the Agent Browser in the DSH sidebar: a real Chromium webview that the user can watch, with a visible agent cursor that never moves the user's mouse. " +
-  "Workflow: action=open with a URL, then action=snapshot to read the page (visible interactive elements get refs), then action=click/type by ref; call snapshot again after each action that changes the page. Refs are only valid for the most recent snapshot. " +
-  "QA actions: viewport {width,height,reset} sets the real CSS viewport (the panel scales to fit) and waits for the guest to report it, evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence (fullPage scroll-stitches viewport captures; fixed/sticky elements may repeat), emulate {colorScheme} applies a best-effort light/dark preference, setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state. " +
+  "Workflow: action=open with a URL (opens recovers once from a stale never-ready panel by remounting; still failing asks for close/open), then action=snapshot to read the page (visible interactive elements get refs), then action=click/type by ref; call snapshot again after each action that changes the page. Refs are only valid for the most recent snapshot. " +
+  "QA actions: viewport {width,height,reset,scrollbars} sets the real CSS viewport (the panel scales to fit), optionally hides the page scrollbars, and reports actual innerWidth/innerHeight + contentWidth (classic scrollbar note), evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence (fullPage scroll-stitches viewport captures with per-stage diagnostics and step timeouts, then reports timings; a taller-than-viewport element is scroll-stitched instead of clipped; fixed/sticky elements may repeat), emulate {colorScheme} applies a best-effort light/dark preference with a DOM fallback for native <picture>/<source media> and <link media> (including open shadow roots), setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state. " +
   "Boundaries: only http(s) navigation — file:// is blocked by the desktop shell (use setContent or preview); deviceScaleFactor/DPR cannot be emulated (no CDP from a renderer <webview>) and screenshots report their real pixel size instead; emulate is best-effort (matchMedia shim + same-origin media-rule rewrite; cross-origin stylesheets cannot be patched); there is no offscreen/CI mode — qa runs in the visible panel. Screenshots save to disk; call read_image with the returned path. Coordinates are CSS pixels inside the page viewport.";
 
 function requireHttpUrl(raw, field) {
@@ -161,6 +166,10 @@ function buildQaPlan(args) {
     outDir = isAbsolute(raw) ? raw : join(SHOT_DIR, raw);
   }
   const selectors = args.selectors === undefined || args.selectors === null ? [] : uniqueStrings(args.selectors, "qa selectors", 20);
+  const scrollbars = args.scrollbars === undefined || args.scrollbars === null ? "auto" : String(args.scrollbars);
+  if (scrollbars !== "auto" && scrollbars !== "hidden") {
+    throw new Error(`browser: qa scrollbars must be "auto" or "hidden"`);
+  }
   return {
     type: "qa",
     url,
@@ -168,6 +177,7 @@ function buildQaPlan(args) {
     themes,
     height,
     fullPage: args.fullPage === true,
+    scrollbars,
     maxVariants,
     outDir,
     selectors,
@@ -231,10 +241,15 @@ function toCommand(action, args) {
     case "viewport": {
       if (args.reset === true) return { type: "viewport", reset: true };
       if (args.width === undefined || args.width === null) throw new Error("browser: viewport requires width (or reset:true)");
+      const scrollbars = args.scrollbars === undefined || args.scrollbars === null ? undefined : String(args.scrollbars);
+      if (scrollbars !== undefined && scrollbars !== "auto" && scrollbars !== "hidden") {
+        throw new Error(`browser: viewport scrollbars must be "auto" or "hidden"`);
+      }
       return {
         type: "viewport",
         width: numberInRange(args.width, "viewport width", 64, 10000),
         height: numberInRange(args.height, "viewport height", 64, 10000, 800),
+        ...(scrollbars === undefined ? {} : { scrollbars }),
       };
     }
     case "evaluate": {
@@ -559,12 +574,13 @@ function formatQaResult(plan, variants) {
   const lines = [];
   lines.push(`qa: ${plan.url}`);
   lines.push(
-    `variants: ${variants.length} (widths ${plan.widths.join(",")}; themes ${plan.themes.join(",")}; height ${plan.height}${plan.fullPage ? "; fullPage" : ""}` +
+    `variants: ${variants.length} (widths ${plan.widths.join(",")}; themes ${plan.themes.join(",")}; height ${plan.height}` +
+      `${plan.fullPage ? "; fullPage" : ""}${plan.scrollbars === "hidden" ? "; scrollbars hidden" : ""}` +
       `${plan.selectors.length > 0 ? `; selectors ${plan.selectors.length}` : ""})`,
   );
   lines.push(`output: ${plan.outDir}`);
   lines.push("");
-  lines.push("width | theme | viewport | doc(w x h) | overflow | images(failed/total) | fonts | console(e/w) | file");
+  lines.push("width | theme | viewport | content | doc(w x h) | overflow | images(failed/total) | fonts | console(e/w) | file");
   for (const variant of variants) {
     const metrics = variant.metrics ?? {};
     const viewport = metrics.viewport ?? {};
@@ -577,6 +593,7 @@ function formatQaResult(plan, variants) {
         String(variant.width),
         String(variant.theme),
         `${viewport.width ?? "?"}x${viewport.height ?? "?"}`,
+        Number.isFinite(Number(documentInfo.contentWidth)) ? String(documentInfo.contentWidth) : "?",
         `${documentInfo.scrollWidth ?? "?"}x${documentInfo.scrollHeight ?? "?"}`,
         String(metrics.overflowCount ?? 0),
         `${images.failed ?? 0}/${images.total ?? 0}`,
@@ -590,6 +607,41 @@ function formatQaResult(plan, variants) {
   lines.push("screenshots:");
   for (const variant of variants) lines.push(`  ${variant.width}x${plan.height} ${variant.theme}: ${variant.screenshot}`);
   return lines.join("\n");
+}
+
+/** Pure notes builder for screenshot receipts (testable without a client). */
+function buildScreenshotNotes(value) {
+  const notes = [];
+  if (value.fullPage !== undefined) {
+    const fullPage = value.fullPage ?? {};
+    const timings = fullPage.timings ?? {};
+    notes.push(
+      `full page: ${fullPage.stitched === true ? `stitched ${fullPage.segments ?? "?"} viewport capture(s), ` : ""}captured ${
+        fullPage.capturedHeight ?? "?"
+      } of ${fullPage.requestedHeight ?? "?"} CSS px` +
+        (fullPage.capped === true ? " (capped at 12000; scroll and capture again for the rest)" : "") +
+        (fullPage.scrollbarsHidden === true ? "; page scrollbars hidden during capture" : "") +
+        (fullPage.stitched === true ? "; position:fixed/sticky elements may repeat in the stitched image" : "") +
+        (Number.isFinite(Number(timings.totalMs)) ? `; took ${timings.totalMs}ms across ${timings.segments ?? fullPage.segments ?? "?"} segment(s)` : ""),
+    );
+  }
+  if (value.mode === "element") {
+    const element = value.element ?? {};
+    notes.push("element capture");
+    if (element.stitched === true) {
+      notes.push(
+        `stitched ${element.segments ?? "?"} scroll capture(s) for the element's full height (${element.capturedHeight ?? "?"}${
+          element.capped === true ? " capped" : ""
+        } of ${element.fullHeight ?? "?"} CSS px)` +
+          (Number(element.croppedWidth ?? 0) > 0 ? `; ${element.croppedWidth}px beyond the viewport width were cropped` : "") +
+          (element.scrollbarsHidden === true ? "; page scrollbars hidden during capture" : ""),
+      );
+    } else if (element.clippedToViewport === true) {
+      notes.push("clipped to the viewport element box");
+    }
+  } else if (value.mode === "clip") notes.push("clip capture");
+  if (Number.isFinite(Number(value.devicePixelRatio))) notes.push(`devicePixelRatio ${value.devicePixelRatio} (not emulated)`);
+  return notes;
 }
 
 function formatResult(action, value) {
@@ -661,13 +713,28 @@ function formatResult(action, value) {
         value.matched === false
           ? ` — warning: the guest viewport did not settle to the requested size within ${value.settledMs ?? "?"}ms (actual ${actual.innerWidth ?? "?"}x${actual.innerHeight ?? "?"})`
           : "";
+      const contentWidth = Number(actual.contentWidth ?? value.contentWidth);
+      const plainScrollbar =
+        Number.isFinite(contentWidth) && contentWidth > 0 && Number(actual.innerWidth) > contentWidth
+          ? `; content width ${contentWidth} (innerWidth is larger by ${Number(actual.innerWidth) - contentWidth}px: classic scrollbar)`
+          : "";
       if (value.reset === true) {
-        return `viewport reset to panel size: ${actual.innerWidth ?? value.width ?? "?"}x${actual.innerHeight ?? value.height ?? "?"} (devicePixelRatio ${dpr})${warning}`;
+        return `viewport reset to panel size: ${actual.innerWidth ?? value.width ?? "?"}x${actual.innerHeight ?? value.height ?? "?"} (devicePixelRatio ${dpr})${plainScrollbar}${warning}`;
       }
+      const scrollbarsNote =
+        value.scrollbars === "hidden"
+          ? `; page scrollbars hidden${
+              Number.isFinite(contentWidth) && contentWidth > 0
+                ? ` (content width ${contentWidth} == viewport width; restored by viewport reset or action=close)`
+                : " (restored by viewport reset or action=close)"
+            }`
+          : "";
       return (
         `viewport: ${value.width}x${value.height} requested; actual ${actual.innerWidth ?? "?"}x${actual.innerHeight ?? "?"}` +
         ` (devicePixelRatio ${dpr})` +
         (Number.isFinite(Number(value.scale)) ? `; panel scale ${Number(value.scale).toFixed(3)}` : "") +
+        plainScrollbar +
+        scrollbarsNote +
         `; settled in ${value.settledMs ?? "?"}ms` +
         warning +
         " — deviceScaleFactor is not emulated (no CDP); screenshots report real pixels"
@@ -687,17 +754,24 @@ function formatResult(action, value) {
       const sheets = value.sheets ?? {};
       const rules = value.mediaRules ?? {};
       const verified = value.verified ?? {};
+      const dom = value.dom ?? {};
       const matchHint =
         verified.darkMatches === undefined
           ? ""
           : `; matchMedia check: dark=${String(verified.darkMatches)}, light=${String(verified.lightMatches)}`;
+      const domHint =
+        value.dom === undefined
+          ? ""
+          : `; DOM fallback: ${dom.picturesPatched ?? 0} <picture> re-picked, ${dom.linkMediaPatched ?? 0} <link media> normalized, ${dom.restored ?? 0} restored` +
+            (dom.limitReached === true ? ` (node scan hit its limit after ${dom.visited ?? "?"} nodes; deep shadow DOMs may be incomplete)` : "");
       return (
         `emulated prefers-color-scheme: ${String(value.scheme ?? "?")} (best-effort, not CDP media emulation)` +
         `; stylesheets ${sheets.scanned ?? "?"} scanned, ${sheets.patched ?? "?"} patched` +
         `${Number(sheets.crossOrigin ?? 0) > 0 ? `, ${sheets.crossOrigin} cross-origin unreadable` : ""}` +
         `; media rules patched ${rules.patched ?? 0}` +
         `${rules.restored !== undefined ? `, restored ${rules.restored}` : ""}` +
-        matchHint
+        matchHint +
+        domHint
       );
     }
     case "setContent": {
@@ -871,7 +945,10 @@ export function apply(ctx) {
     try {
       for (const width of plan.widths) {
         requireOk(await push("navigate", { type: "navigate", url: plan.url }, stepTimeoutMs), "qa navigate");
-        requireOk(await push("viewport", { type: "viewport", width, height: plan.height }, stepTimeoutMs), "qa viewport");
+        requireOk(
+          await push("viewport", { type: "viewport", width, height: plan.height, scrollbars: plan.scrollbars }, stepTimeoutMs),
+          "qa viewport",
+        );
         for (const theme of plan.themes) {
           requireOk(await push("emulate", { type: "emulate", colorScheme: theme }, stepTimeoutMs), "qa emulate");
           await push("wait", { type: "wait", ms: 250 }, stepTimeoutMs);
@@ -912,7 +989,11 @@ export function apply(ctx) {
   }
 
   async function executeScreenshot(command) {
-    const outcome = await push("screenshot", command);
+    // A fullPage stitch legitimately runs longer than the per-command default
+    // (many viewport captures over an external page), so it rides a dedicated
+    // long bridge timeout; the client bounds every internal step plus a 60s
+    // budget, so this window only protects slow-but-healthy stitches.
+    const outcome = await push("screenshot", command, command.fullPage === true ? FULLPAGE_SCREENSHOT_TIMEOUT_MS : COMMAND_TIMEOUT_MS);
     const value = outcome.value;
     if (value === undefined || value === null || value.ok !== true) {
       return { text: `browser screenshot failed: ${String(value?.error ?? "no result from the client")}` };
@@ -924,21 +1005,7 @@ export function apply(ctx) {
       return { text: `browser screenshot failed: ${String(error && error.message ? error.message : error)}` };
     }
     const dimensions = saved.width !== undefined && saved.height !== undefined ? `${saved.width}x${saved.height}px` : "size unknown";
-    const notes = [];
-    if (value.fullPage !== undefined) {
-      const fullPage = value.fullPage ?? {};
-      notes.push(
-        `full page: ${fullPage.stitched === true ? `stitched ${fullPage.segments ?? "?"} viewport capture(s), ` : ""}captured ${
-          fullPage.capturedHeight ?? "?"
-        } of ${fullPage.requestedHeight ?? "?"} CSS px` +
-          (fullPage.capped === true ? " (capped at 12000; scroll and capture again for the rest)" : "") +
-          (fullPage.scrollbarsHidden === true ? "; page scrollbars hidden during capture" : "") +
-          (fullPage.stitched === true ? "; position:fixed/sticky elements may repeat in the stitched image" : ""),
-      );
-    }
-    if (value.mode === "element") notes.push("element capture");
-    else if (value.mode === "clip") notes.push("clip capture");
-    if (Number.isFinite(Number(value.devicePixelRatio))) notes.push(`devicePixelRatio ${value.devicePixelRatio} (not emulated)`);
+    const notes = buildScreenshotNotes(value);
     return {
       text:
         `screenshot saved: ${saved.file} (${dimensions}, ${saved.bytes} bytes, ${saved.format})` +
@@ -973,6 +1040,11 @@ export function apply(ctx) {
             width: { type: "number", description: "Viewport width in CSS px for action=viewport (64..10000)." },
             height: { type: "number", description: "Viewport height in CSS px for action=viewport (default 800); qa height uses the same field." },
             reset: { type: "boolean", description: "For action=viewport: restore the panel-sized viewport." },
+            scrollbars: {
+              type: "string",
+              enum: ["auto", "hidden"],
+              description: "For action=viewport (and qa): 'hidden' hides the page scrollbars persistently so contentWidth == viewport width; restore with reset or default 'auto'.",
+            },
             expression: { type: "string", description: "JavaScript expression for action=evaluate; the JSON result is capped at 16KB." },
             selectors: {
               type: "array",
@@ -1009,6 +1081,11 @@ export function apply(ctx) {
             dir: { type: "string", description: "For action=preview: local directory to serve over a tokenized 127.0.0.1 URL." },
             file: { type: "string", description: "For action=preview: file served at the base URL (relative to dir)." },
             port: { type: "number", description: "For action=preview: fixed port; default is a free port." },
+            scrollbars: {
+              type: "string",
+              enum: ["auto", "hidden"],
+              description: "For action=qa: hide the page scrollbars in every variant viewport (default auto).",
+            },
             widths: {
               type: "array",
               items: { type: "number" },
@@ -1072,4 +1149,6 @@ export const __test = {
   MAX_EVALUATE_BYTES,
   MAX_SET_CONTENT_BYTES,
   MAX_QA_VARIANTS,
+  FULLPAGE_SCREENSHOT_TIMEOUT_MS,
+  buildScreenshotNotes,
 };

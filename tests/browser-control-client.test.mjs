@@ -19,6 +19,11 @@ function makeWebviewMock(options = {}) {
   // trackingScroll emulates a real scroll container for fullPage stitching:
   // window.scrollTo() moves the reported position (clamped to the page).
   let pageScroll = 120;
+  // A classic scrollbar (15px) is subtracted from contentWidth until the page
+  // hides it with the scrollbarVisibility script (viewport scrollbars:"hidden").
+  let pageScrollHeight = options.pageScrollHeight ?? 900;
+  let scrollbarsHiddenQ = false;
+  const scrollbarWidthQ = options.scrollbarWidth ?? 15;
   const webview = {
     style: {},
     ...(options.capturePage !== undefined ? { capturePage: options.capturePage } : {}),
@@ -32,7 +37,12 @@ function makeWebviewMock(options = {}) {
         return { editable: true, tag: "input", value: "deepseek harness" };
       }
       if (code.includes("__dshAgentCursorVisibility")) return { found: true, hidden: true, previous: "" };
-      if (code.includes("__dshAgentScrollbarVisibility")) return { hidden: code.includes("if (true)"), created: true };
+      if (code.includes("__dshAgentScrollbarVisibility")) {
+        const hiding = code.includes("if (true)");
+        if (hiding) scrollbarsHiddenQ = true;
+        else scrollbarsHiddenQ = false;
+        return { hidden: hiding, created: true };
+      }
       if (code.includes("__dshAgentCursorMove")) return { moved: true };
       if (code.includes("__dshAgentClickTarget")) {
         if (options.clickTargetError !== undefined) return { ok: false, error: options.clickTargetError };
@@ -54,10 +64,13 @@ function makeWebviewMock(options = {}) {
         const heightText = String(webview.style.height ?? "");
         const styleWidth = options.ignoreViewportStyle === true ? Number.NaN : widthText.endsWith("px") ? Number.parseFloat(widthText) : Number.NaN;
         const styleHeight = options.ignoreViewportStyle === true ? Number.NaN : heightText.endsWith("px") ? Number.parseFloat(heightText) : Number.NaN;
+        const innerWidth = Number.isFinite(styleWidth) ? Math.round(styleWidth) : options.viewportWidth ?? 1280;
+        const innerHeight = Number.isFinite(styleHeight) ? Math.round(styleHeight) : options.viewportHeight ?? 800;
         return {
-          innerWidth: Number.isFinite(styleWidth) ? Math.round(styleWidth) : options.viewportWidth ?? 1280,
-          innerHeight: Number.isFinite(styleHeight) ? Math.round(styleHeight) : options.viewportHeight ?? 800,
+          innerWidth,
+          innerHeight,
           devicePixelRatio: options.devicePixelRatio ?? 1,
+          contentWidth: innerWidth - (scrollbarsHiddenQ ? 0 : scrollbarWidthQ),
           scrollWidth: options.viewportWidth ?? 1280,
           scrollHeight: 2400,
         };
@@ -103,11 +116,17 @@ function makeWebviewMock(options = {}) {
       }
       if (code.includes("__dshAgentScreenshotTarget")) {
         if (options.screenshotTargetError !== undefined) return { ok: false, error: options.screenshotTargetError };
+        if (options.screenshotTarget !== undefined) return { ok: true, ...options.screenshotTarget };
         return {
           ok: true,
           viewport: { width: 575, height: 742, devicePixelRatio: 1 },
           rect: { x: 10, y: 20, width: 120, height: 40 },
           clipped: false,
+          // Fully visible at the measured scroll position: the default target
+          // must keep the legacy clip-to-viewport behaviour (no stitching).
+          full: { x: 10, y: 140, width: 120, height: 40 },
+          scrollX: 0,
+          scrollY: 120,
           target: { tag: "button", label: "Save" },
         };
       }
@@ -137,13 +156,13 @@ function makeWebviewMock(options = {}) {
       }
       if (options.trackingScroll === true && code.includes("window.scrollTo({")) {
         const match = /window\.scrollTo\(\{\s*top:\s*(-?\d+(?:\.\d+)?)/.exec(code);
-        if (match) pageScroll = Math.max(0, Math.min(Number(match[1]), 900 - 742));
+        if (match) pageScroll = Math.max(0, Math.min(Number(match[1]), pageScrollHeight - 742));
         return 1;
       }
       if (code.includes("__dshAgentScrollState")) {
         return options.trackingScroll === true
-          ? { scrollY: pageScroll, scrollHeight: 900, innerHeight: 742 }
-          : { scrollY: options.statefulScroll === true ? scrollY : 120, scrollHeight: 900, innerHeight: 742 };
+          ? { scrollY: pageScroll, scrollHeight: pageScrollHeight, innerHeight: 742 }
+          : { scrollY: options.statefulScroll === true ? scrollY : 120, scrollHeight: pageScrollHeight, innerHeight: 742 };
       }
       if (code.includes("__dshAgentFocusedValue")) return { value: "deepseek harness" };
       if (code.includes("__dshAgentFocus")) return { ok: true };
@@ -196,9 +215,12 @@ function makeDshDesktop(acquireError) {
   };
 }
 
-function makeController(options = {}) {  const loaded = loadClientBundle(clientFile, {
+function makeController(options = {}) {
+  const loaded = loadClientBundle(clientFile, {
     webview: options.webview,
     dshDesktop: options.desktop,
+    ...(options.imageDecodeHangs === true ? { imageDecodeHangs: true } : {}),
+    ...(options.imageOnload === true ? { imageOnload: true } : {}),
   });
   const internals = loaded.plugin.__test;
   assert.ok(internals && typeof internals.createPanelController === "function", "plugin must expose __test.createPanelController");
@@ -213,6 +235,8 @@ function makeController(options = {}) {  const loaded = loadClientBundle(clientF
     ...(options.evaluateResultLimit !== undefined ? { evaluateResultLimit: options.evaluateResultLimit } : {}),
     ...(options.fullPageMaxCssPx !== undefined ? { fullPageMaxCssPx: options.fullPageMaxCssPx } : {}),
     ...(options.captureTimeoutMs !== undefined ? { captureTimeoutMs: options.captureTimeoutMs } : {}),
+    ...(options.decodeTimeoutMs !== undefined ? { decodeTimeoutMs: options.decodeTimeoutMs } : {}),
+    ...(options.fullPageBudgetMs !== undefined ? { fullPageBudgetMs: options.fullPageBudgetMs } : {}),
     ...(options.viewportSettleMs !== undefined ? { viewportSettleMs: options.viewportSettleMs } : {}),
     ensurePanel: () => {
       ensurePanelCalls += 1;
@@ -230,6 +254,8 @@ async function mountController(options = {}) {
     webview: () => mock.webview,
     desktop,
     navigationWaitMs: options.navigationWaitMs ?? 0,
+    ...(options.imageDecodeHangs === true ? { imageDecodeHangs: true } : {}),
+    ...(options.imageOnload === true ? { imageOnload: true } : {}),
     ...(options.controllerOptions ?? {}),
   });
   const container = built.loaded.context.document.createElement("div");
@@ -1076,4 +1102,312 @@ test("click navigation replays the current theme emulation on the new document",
   assert.equal(clicked.navigated, true);
   assert.equal(countEmulates(), 2, "a click that navigates must replay the theme shim on the new document");
   controller.unmount();
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.4 round 2: stale open recovery, fullPage hardening, viewport scrollbars
+// + contentWidth, tall-element scroll stitching.
+// ---------------------------------------------------------------------------
+
+function makeCountingDesktop() {
+  const state = { released: [], acquireCalls: 0 };
+  const desktop = {
+    protocolVersion: 1,
+    browser: {
+      async acquire() {
+        state.acquireCalls += 1;
+        return { lease: `lease-${state.acquireCalls}`, partition: `partition-${state.acquireCalls}` };
+      },
+      async release(lease) {
+        state.released.push(lease);
+      },
+      onOpenRequested() {
+        return () => {};
+      },
+    },
+  };
+  return { desktop, state };
+}
+
+test("open recovers once from a stale panel whose webview never becomes ready", async () => {
+  const mock = makeWebviewMock();
+  const { desktop, state } = makeCountingDesktop();
+  const { loaded, controller } = makeController({ webview: () => mock.webview, desktop });
+  const openPromise = controller.handle({ type: "open", url: "https://example.com/" });
+  await flushMicrotasks();
+  const container = loaded.context.document.createElement("div");
+  controller.mount(container).catch(() => {});
+  await flushMicrotasks();
+  // The first webview never fires dom-ready: trip its 2.5s ready wait (and the
+  // attach cap, which fires in the same drain).
+  loaded.flushTimers();
+  await flushMicrotasks();
+  const webviews = container.children.filter((child) => child.tagName === "WEBVIEW");
+  assert.equal(webviews.length, 2, "the stale guest must be unmounted and a fresh one mounted into the same container");
+  assert.equal(state.acquireCalls, 2, "exactly one remount: two leases in total");
+  assert.deepEqual(state.released, ["lease-1"], "the stale lease was released before remounting");
+  webviews.at(-1).dispatch("dom-ready", {});
+  await flushMicrotasks();
+  const result = await openPromise;
+  assert.equal(result.ok, true);
+  assert.match(result.url, /example\.com/);
+  const remountDiags = loaded.fetchCalls
+    .filter((call) => call.url.includes("/diag"))
+    .map((call) => JSON.parse(String(call.init?.body ?? "{}")))
+    .filter((body) => body?.value?.phase === "stale-remounted");
+  assert.ok(remountDiags.length >= 1, "the recovery should record a stale-remounted diagnostic");
+  controller.unmount();
+});
+
+test("open surfaces a close/open recovery hint after one remount and the floating fallback fail", async () => {
+  const mock = makeWebviewMock();
+  const { desktop } = makeCountingDesktop();
+  const { loaded, controller } = makeController({ webview: () => mock.webview, desktop });
+  const openPromise = controller.handle({ type: "open", url: "https://example.com/" });
+  await flushMicrotasks();
+  const container = loaded.context.document.createElement("div");
+  controller.mount(container).catch(() => {});
+  await flushMicrotasks();
+  loaded.flushTimers(); // trip the first waitReady + first attach cap
+  await flushMicrotasks(); // stale detection: unmount + second mount starts
+  loaded.flushTimers(); // trip the second attach cap (remount never ready)
+  await flushMicrotasks(); // floating fallback is unavailable -> final waitReady
+  loaded.flushTimers(); // trip the final waitReady
+  await flushMicrotasks();
+  await assert.rejects(
+    () => openPromise,
+    /close the Agent Browser tab and call action=open/,
+    "the caller must get an actionable close/open hint, not a bare timeout",
+  );
+  controller.unmount();
+});
+
+test("fullPage stitches report stage diagnostics, per-step timings and finished inside the budget", async () => {  const mounted = await mountController({
+    controllerOptions: { fullPageMaxCssPx: 1200, fullPageBudgetMs: 10000 },
+    webviewOptions: {
+      trackingScroll: true,
+      pageScrollHeight: 3000,
+      capturePage: async () => ({ toDataURL: () => "data:image/png;base64,AAAA" }),
+    },
+  });
+  const result = await mounted.controller.handle({ type: "screenshot", fullPage: true });
+  assert.equal(result.ok, true);
+  const timings = result.fullPage.timings;
+  assert.equal(timings.segments, result.fullPage.segments);
+  assert.equal(Array.isArray(timings.captureMs), true);
+  assert.equal(Array.isArray(timings.encodeMs), true);
+  assert.equal(timings.captureMs.length, timings.segments, "one capture timing per stitched segment");
+  assert.equal(timings.encodeMs.length, timings.segments, "one encode timing per stitched segment");
+  assert.ok(Number.isFinite(timings.totalMs) && timings.totalMs >= 0, `totalMs must be reported, got ${timings.totalMs}`);
+  const diagFases = new Set(
+    mounted.loaded.fetchCalls
+      .filter((call) => call.url.includes("/diag"))
+      .map((call) => JSON.parse(String(call.init?.body ?? "{}")))
+      .filter((body) => body?.tag === "fullpage")
+      .map((body) => body.value?.phase),
+  );
+  for (const phase of ["begin", "hideScrollbars", "segment-start", "segment-capture", "segment-encode", "stitch", "restore"]) {
+    assert.equal(diagFases.has(phase), true, `the fullPage capture must post the "${phase}" stage diagnostic`);
+  }
+  assert.equal(diagFases.has("error"), false, "a successful capture must not post an error stage");
+  mounted.controller.unmount();
+});
+
+test("a hanging segment decode times out with a phase label instead of wedging the stitch", async () => {
+  const mounted = await mountController({
+    imageDecodeHangs: true,
+    controllerOptions: { decodeTimeoutMs: 40 },
+    webviewOptions: {
+      trackingScroll: true,
+      pageScrollHeight: 2000,
+      capturePage: async () => ({ toDataURL: () => "data:image/png;base64,AAAA" }),
+    },
+  });
+  const { controller, loaded } = mounted;
+  const shot = controller.handle({ type: "screenshot", fullPage: true });
+  // Drive the mocked capture loop: every mocked call settles inside
+  // microtasks, so keep flushing until the only outstanding sandbox timer is
+  // the decode deadline (flushing earlier would trip a capture race instead).
+  for (let round = 0; round < 8; round += 1) await flushMicrotasks(30);
+  const pendingTimers = loaded.timers.map((timer) => timer.ms);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(pendingTimers)),
+    [40],
+    `only the decode deadline may remain pending, got ${JSON.stringify(pendingTimers)}`,
+  );
+  loaded.flushTimers();
+  await flushMicrotasks(30);
+  await assert.rejects(() => shot, /image decode timed out after 40ms/, "the decode timeout must carry an explicit phase label");
+  const errorDiags = loaded.fetchCalls
+    .filter((call) => call.url.includes("/diag"))
+    .map((call) => JSON.parse(String(call.init?.body ?? "{}")))
+    .filter((body) => body?.tag === "fullpage" && body.value?.phase === "error");
+  assert.ok(errorDiags.length >= 1, "the failed capture must post an error stage to the diagnostic channel");
+  const after = await controller.handle({ type: "snapshot" });
+  assert.equal(after.ok, true, "commands must still be served after the capture bailed out");
+  controller.unmount();
+});
+
+test("fullPage stops at its total wall budget and reports how far it got", async () => {
+  const mounted = await mountController({
+    controllerOptions: { fullPageBudgetMs: 1 },
+    webviewOptions: {
+      trackingScroll: true,
+      pageScrollHeight: 3000,
+      // A real async capture makes the wall clock advance across segments even
+      // with the instant sleep mock.
+      capturePage: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 4));
+        return { toDataURL: () => "data:image/png;base64,AAAA" };
+      },
+    },
+  });
+  const shot = mounted.controller.handle({ type: "screenshot", fullPage: true });
+  await flushMicrotasks();
+  await assert.rejects(() => shot, /exceeded its 1ms budget/, "the total budget must abort the capture instead of hanging");
+  const after = await mounted.controller.handle({ type: "snapshot" });
+  assert.equal(after.ok, true, "commands must still be served after a budget abort");
+  mounted.controller.unmount();
+});
+
+test("viewport scrollbars:'hidden' hides page scrollbars persistently and reports contentWidth", async () => {
+  const mounted = await mountController({
+    webviewOptions: { viewportWidth: 575, viewportHeight: 742, scrollbarWidth: 15 },
+  });
+  const { controller, calls, mock } = mounted;
+  const hidden = await controller.handle({ type: "viewport", width: 800, height: 600, scrollbars: "hidden" });
+  assert.equal(hidden.ok, true);
+  assert.equal(hidden.scrollbars, "hidden");
+  assert.equal(hidden.contentWidth, 800, "with scrollbars hidden the content gets the full viewport width");
+  assert.equal(hidden.actual.contentWidth, 800);
+  assert.equal(mock.webview.style.width, "800px");
+  const hideCalls = calls.executeJavaScript.filter((code) => code.includes("__dshAgentScrollbarVisibility"));
+  assert.match(hideCalls.at(-1), /if \(true\)/, "viewport scrollbars:'hidden' must inject the same hide style fullPage uses");
+
+  const auto = await controller.handle({ type: "viewport", width: 390, height: 844 });
+  assert.equal(auto.scrollbars, "auto");
+  assert.equal(auto.contentWidth, 375, "with classic scrollbars the content width is innerWidth minus the scrollbar");
+  const restoreCalls = calls.executeJavaScript.filter((code) => code.includes("__dshAgentScrollbarVisibility"));
+  assert.match(restoreCalls.at(-1), /if \(false\)/, "switching back to auto removes the persistent hide style");
+
+  // The persistent hide style must be replayed on a fresh document.
+  await controller.handle({ type: "viewport", width: 800, height: 600, scrollbars: "hidden" });
+  const before = calls.executeJavaScript.length;
+  await controller.handle({ type: "navigate", url: "https://example.com/next" });
+  const after = calls.executeJavaScript.slice(before).filter((code) => code.includes("__dshAgentScrollbarVisibility"));
+  assert.match(after.at(-1), /if \(true\)/, "navigation must replay the hidden-scrollbar style");
+
+  const reset = await controller.handle({ type: "viewport", reset: true });
+  assert.equal(reset.scrollbars, "auto");
+  const finalCalls = calls.executeJavaScript.filter((code) => code.includes("__dshAgentScrollbarVisibility"));
+  assert.match(finalCalls.at(-1), /if \(false\)/, "viewport reset must remove the persistent hide style");
+  controller.unmount();
+});
+
+test("tall element screenshots scroll-stitch the element instead of clipping the first screen", async () => {
+  const captured = [];
+  const mounted = await mountController({
+    webviewOptions: {
+      trackingScroll: true,
+      // The page must be tall enough to hold the whole element (400 + 2226).
+      pageScrollHeight: 3000,
+      capturePage: async (rect) => {
+        captured.push({ ...rect });
+        return { toDataURL: () => "data:image/png;base64,AAAA" };
+      },
+      screenshotTarget: {
+        viewport: { width: 575, height: 742, devicePixelRatio: 1 },
+        rect: { x: 0, y: 0, width: 500, height: 742 },
+        clipped: true,
+        full: { x: 0, y: 400, width: 500, height: 2226 },
+        scrollX: 0,
+        scrollY: 400,
+        target: { tag: "section", label: "Very Tall" },
+      },
+    },
+  });
+  const { controller, calls } = mounted;
+  const result = await controller.handle({ type: "screenshot", selector: ".very-tall" });
+  assert.equal(result.ok, true);
+  assert.equal(result.mode, "element", "the receipt mode stays 'element' for a stitched tall element");
+  const element = result.element;
+  assert.equal(element.stitched, true);
+  assert.equal(element.segments, 3, "2226 CSS px at a 742 px viewport needs three slices");
+  assert.equal(element.fullHeight, 2226);
+  assert.equal(element.fullWidth, 500);
+  assert.equal(element.capped, false);
+  assert.equal(element.croppedWidth, 0);
+  assert.equal(captured.length, 3, "one capturePage(rect) per element slice");
+  for (const rect of captured) {
+    assert.deepEqual(
+      { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      { x: 0, y: 0, width: 500, height: 742 },
+      "each slice captures the element's visible band of the viewport",
+    );
+  }
+  {
+    const canvas = mounted.loaded.elements.find((el) => Array.isArray(el.__draws) && el.__draws.length > 0 && el.width === 500);
+    assert.ok(canvas, "the slices must be stitched into one element-sized canvas");
+    assert.equal(canvas.height, 2226);
+    assert.deepEqual(plain(canvas.__draws.map((draw) => draw.y)), [0, 742, 1484], "slices line up at their clamped scroll offsets");
+    assert.deepEqual(plain(canvas.__draws.map((draw) => draw.height)), [742, 742, 742]);
+  }
+  // Restore: scroll position and scrollbar style are put back after capture.
+  const scrollToCalls = calls.executeJavaScript.filter((code) => code.includes("window.scrollTo({"));
+  assert.match(
+    scrollToCalls.at(-1),
+    /window\.scrollTo\(\{ top: 120, left: 0, behavior: 'instant' \}\)/,
+    "the original (pre-capture) scroll position must be restored",
+  );
+  const scrollbarCalls = calls.executeJavaScript.filter((code) => code.includes("__dshAgentScrollbarVisibility"));
+  assert.match(scrollbarCalls.at(-1), /if \(false\)/, "the hide-scrollbar style must be removed after the capture");
+  controller.unmount();
+});
+
+test("super-tall element captures stop at the 12000-cap and over-wide elements are cropped, not faked", async () => {
+  const capped = await mountController({
+    controllerOptions: { fullPageMaxCssPx: 1200 },
+    webviewOptions: {
+      trackingScroll: true,
+      pageScrollHeight: 6000,
+      capturePage: async () => ({ toDataURL: () => "data:image/png;base64,AAAA" }),
+      screenshotTarget: {
+        viewport: { width: 575, height: 742, devicePixelRatio: 1 },
+        rect: { x: 0, y: 0, width: 500, height: 742 },
+        clipped: true,
+        full: { x: 0, y: 400, width: 500, height: 5000 },
+        scrollX: 0,
+        scrollY: 400,
+        target: { tag: "section", label: "Extremely Tall" },
+      },
+    },
+  });
+  const cappedShot = await capped.controller.handle({ type: "screenshot", selector: ".extremely-tall" });
+  assert.equal(cappedShot.element.capped, true, "the total element height is capped like fullPage");
+  assert.equal(cappedShot.element.capturedHeight, 1200);
+  assert.equal(cappedShot.element.segments, 2);
+  assert.equal(cappedShot.element.fullHeight, 5000);
+  assert.deepEqual(plain(cappedShot.element.fullRect), { x: 0, y: 400, width: 500, height: 5000 });
+  capped.controller.unmount();
+
+  const mounted = await mountController({
+    webviewOptions: {
+      trackingScroll: true,
+      pageScrollHeight: 2400,
+      capturePage: async () => ({ toDataURL: () => "data:image/png;base64,AAAA" }),
+      screenshotTarget: {
+        viewport: { width: 575, height: 742, devicePixelRatio: 1 },
+        rect: { x: 500, y: 0, width: 75, height: 742 },
+        clipped: true,
+        full: { x: 500, y: 120, width: 600, height: 1000 },
+        scrollX: 0,
+        scrollY: 120,
+        target: { tag: "section", label: "Wide And Tall" },
+      },
+    },
+  });
+  const wide = await mounted.controller.handle({ type: "screenshot", selector: ".wide-tall" });
+  assert.equal(wide.element.segments, 2);
+  assert.equal(wide.element.croppedWidth, 525, "the part beyond the viewport width is reported as cropped");
+  mounted.controller.unmount();
 });
