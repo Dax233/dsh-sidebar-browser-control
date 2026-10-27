@@ -909,3 +909,26 @@ diag 事件链为 `mount-acquired → webview did not attach within 10s（mount-
   attach 重试（同一元素 re-append、ensurePanel 再跑、ready 后成功）、既有 stale 恢复与最终错误文案；
   共 **122 项全绿**。
 - 真机复验（重启后）：黑标签被清理、`browser open` 一次成功、随后重跑 fullPage/picture/scrollbars/高元素。
+
+### 34.12 黑面板与 status.panel 几何诊断（2026-10-27，0.2.7 → 0.2.8）
+
+0.2.7 修好挂载后，真机（本会话）出现「tab 在、面板全黑，但所有 browser 命令都正常」
+（open/evaluate/screenshot/qa 都返回真实数据）。用真实屏幕捕获（Graphics.CopyFromScreen，
+非 PrintWindow）确认黑面板不是截图伪影；点击 tab、UIA 树都改变不了。
+
+推断与实际一致的机制：React 在 tab body 重渲染时把我们的 body 挂到**新的容器**，而
+`ensureMounted()` 旧实现只要 `webview !== undefined` 就直接 return → guest 留在已被替换的
+（detached）旧容器里，命令仍能执行，但不参与合成 → 面板全黑。
+
+0.2.8 修复：
+
+- `ensureMounted(container)` 检测容器变化：把现有 guest `appendChild` 到新容器（真 DOM 的
+  append 会从旧父节点移除），更新 `mountContainer/lastMountContainer`，并写
+  `guest-reattached` 诊断（附几何）。容器未变时仍走原来的 ready 判断。
+- `status` 新增 `panel` 字段：container/element 的 rect + `connected` + `element.parentIsContainer`
+  + element 的 display/visibility/transform，用来一眼区分「detached / 零尺寸 / 隐藏 / 正常」。
+- 测试：status 几何形状（正常挂载时 parentIsContainer/connected/尺寸）、以及重新挂到新容器后
+  旧容器不再持有 guest；harness 的 fake DOM 增加 parentNode/append 移动语义与
+  getBoundingClientRect。共 **124 项全绿**。
+- 真机复验（重启后）：用 CopyFromScreen 抓 DSH 窗口，确认右侧面板是否显示页面；
+  同时用 `browser status` 的 `panel` 字段核对容器/元素几何。

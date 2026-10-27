@@ -375,6 +375,36 @@ test("controller mounts a leased webview and resolves on dom-ready", async () =>
   assert.deepEqual(released, ["lease-test"]);
 });
 
+test("status exposes the guest/container geometry used to diagnose black panes", async () => {
+  const mounted = await mountController({ webviewOptions: {} });
+  const status = mounted.controller.status();
+  assert.equal(status.panel.hasWebview, true);
+  assert.equal(status.panel.container.connected, true);
+  assert.equal(status.panel.element.connected, true);
+  assert.equal(status.panel.element.parentIsContainer, true, "the guest must live in the mounted container");
+  assert.ok(status.panel.container.width > 0 && status.panel.container.height > 0);
+  mounted.controller.unmount();
+});
+
+test("ensureMounted reattaches an existing guest into a new tab-body container", async () => {
+  const mounted = await mountController({ webviewOptions: {} });
+  const second = mounted.loaded.context.document.createElement("div");
+  second.clientWidth = 520;
+  second.clientHeight = 720;
+  await mounted.controller.ensureMounted(second);
+  const moved = second.children.filter((child) => child.tagName === "WEBVIEW");
+  assert.equal(moved.length, 1, "the existing guest moves into the new container");
+  assert.equal(
+    mounted.container.children.filter((child) => child.tagName === "WEBVIEW").length,
+    0,
+    "it must not stay in the stale container",
+  );
+  const status = mounted.controller.status();
+  assert.equal(status.panel.element.parentIsContainer, true);
+  assert.equal(status.panel.container.width, 520);
+  mounted.controller.unmount();
+});
+
 test("navigate rejects non-http(s) and loads allowed URLs", async () => {
   const { webview, calls } = makeWebviewMock();
   const { desktop } = makeDshDesktop();

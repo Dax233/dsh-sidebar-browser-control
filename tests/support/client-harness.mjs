@@ -73,7 +73,22 @@ function makeElement(tag = "div") {
     dataset: {},
     attributes: {},
     listeners,
+    // Fake DOM nodes count as connected; appendChild moves a node between
+    // parents like the real DOM (the guest re-attach path relies on it).
+    isConnected: true,
+    __parent: null,
+    get parentNode() {
+      return this.__parent;
+    },
     appendChild(child) {
+      if (child !== null && typeof child === "object" && child.__parent !== undefined) {
+        const previous = child.__parent;
+        if (previous !== null && previous !== this) {
+          const index = previous.children.indexOf(child);
+          if (index >= 0) previous.children.splice(index, 1);
+        }
+        child.__parent = this;
+      }
       this.children.push(child);
       return child;
     },
@@ -81,10 +96,16 @@ function makeElement(tag = "div") {
       const index = this.children.indexOf(child);
       if (index < 0) throw new Error("the node to be removed is not a child of this node");
       this.children.splice(index, 1);
+      if (child !== null && typeof child === "object") child.__parent = null;
       return child;
     },
     setAttribute(name, value) {
       this.attributes[name] = String(value);
+    },
+    getBoundingClientRect() {
+      const width = Number(this.clientWidth ?? 0);
+      const height = Number(this.clientHeight ?? 0);
+      return { x: 0, y: 0, top: 0, left: 0, width, height, right: width, bottom: height };
     },
     getAttribute(name) {
       return this.attributes[name] ?? null;

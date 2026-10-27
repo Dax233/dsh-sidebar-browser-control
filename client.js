@@ -1480,7 +1480,23 @@ window.__ModuleLoader__.load({
       }
 
       function ensureMounted(container) {
-        if (webview !== undefined) return Promise.resolve();
+        if (webview !== undefined) {
+          // React can remount a tab body into a NEW container while our guest
+          // element stays in the old (now detached) one: the guest keeps
+          // working for CDP-like calls but is no longer composited, so the pane
+          // renders black. Move the guest into the live container.
+          try {
+            if (container !== undefined && webview.parentNode !== container) {
+              container.appendChild(webview);
+              mountContainer = container;
+              lastMountContainer = container;
+              void postDiag("panel", { phase: "guest-reattached", geometry: panelGeometry() });
+            }
+          } catch (error) {
+            void postDiag("panel", { phase: "guest-reattach-failed", error: String(error && error.message ? error.message : error) });
+          }
+          return ready ? Promise.resolve() : waitReady();
+        }
         return mount(container);
       }
 
@@ -1627,6 +1643,52 @@ window.__ModuleLoader__.load({
         }
         if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined;
         return { width: Math.round(width), height: Math.round(height) };
+      }
+
+      /**
+       * Geometry of the mounted guest and its container. A black pane with a
+       * working guest means the element is detached, zero-sized or hidden, so
+       * status exposes exactly those facts.
+       */
+      function panelGeometry() {
+        const rectOf = (node) => {
+          if (node === undefined || node === null) return undefined;
+          try {
+            const rect = node.getBoundingClientRect();
+            return {
+              x: Math.round(Number(rect.x ?? 0)),
+              y: Math.round(Number(rect.y ?? 0)),
+              width: Math.round(Number(rect.width ?? 0)),
+              height: Math.round(Number(rect.height ?? 0)),
+            };
+          } catch {
+            return undefined;
+          }
+        };
+        const element = webview;
+        const container = mountContainer;
+        let style;
+        if (element !== undefined) {
+          try {
+            const computed = globalThis.getComputedStyle?.(element);
+            style = computed === undefined ? undefined : { display: computed.display, visibility: computed.visibility, transform: computed.transform };
+          } catch {
+            style = undefined;
+          }
+        }
+        return {
+          hasWebview: element !== undefined,
+          container: container === undefined ? undefined : { ...rectOf(container), connected: container.isConnected === true },
+          element:
+            element === undefined
+              ? undefined
+              : {
+                  ...rectOf(element),
+                  connected: element.isConnected === true,
+                  parentIsContainer: container !== undefined && element.parentNode === container,
+                  ...(style === undefined ? {} : { style }),
+                },
+        };
       }
 
       /** Scale that fits the requested guest viewport into the visible panel. */
@@ -2860,6 +2922,10 @@ window.__ModuleLoader__.load({
               ? { auto: true }
               : { width: viewportState.width, height: viewportState.height, scale: viewportState.scale, auto: false },
           theme: themeState,
+          // Where the guest actually lives: a pane renders black while the
+          // element sits in a detached/zero-sized container even though every
+          // command still works, so expose the geometry for diagnosis.
+          panel: panelGeometry(),
           console: { errors: consoleCounts.error, warnings: consoleCounts.warning, total: consoleTotal, buffer: consoleLog.length },
           lastUrl: lastNavigation.url || url,
           lastTitle: lastNavigation.title || lastSnapshot?.title || "",
