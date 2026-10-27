@@ -871,3 +871,41 @@ sandbox 场景。截图相关的 fullPage/元素/clip/qa 待 0.2.2 重启后再�
   SHADOW DARK；auto → 回到真实偏好（dark）。
 
 
+
+### 34.11 侧栏挂载失败与黑标签（2026-10-27 第三轮反馈，0.2.6 → 0.2.7）
+
+第三轮真机验收（用户侧）报告：`browser open` 连续失败 22–25s，
+`Agent Browser panel did not become ready in time` / `no client result before timeout`；
+diag 事件链为 `mount-acquired → webview did not attach within 10s（mount-failed）
+→ reopen-mount-failed → ready-stale → unmount → mount-start → mount-acquired
+→ webview did not attach within 10s（stale-remount-failed）`；侧栏里还有大量黑色空标签。
+
+分析（结合 0.2.7 修复前的真机 diag）：
+
+1. **黑标签的来源**：旧实现每次模块加载 mint 随机 `TAB_SUFFIX`（`agent-browser-xxxxxx`），
+   DSH 把 tab 存进 `dsh.sidebar-right.v1.<sessionId>`，重启后旧 tab 仍在布局里、其类型
+   已不再注册 → 渲染成黑色空面板；每次重启又多一个，于是"标签页越积越多、都是黑的"。
+2. **挂载失败的来源**：`<webview>` 的 attach 依赖该 tab 真正被选中/可见；旧 `ensurePanel`
+   调 `openTab(kind)` 不带 `revealIfOpened`，一旦布局里选中了别的（黑）标签，body 虽然挂载、
+   guest 却一直不 attach，10s 后 mount 失败；社区证据：同一容器后来一次重挂（tab 被选中时）
+   2ms 就 dom-ready。
+3. 0.2.4 的 unmount/remount 只换 guest、不换 tab，所以两次都救不回来。
+
+0.2.7 修复：
+
+- **稳定 tab 身份**：`TAB_ID = @local/dsh-sidebar-browser-control`，`TAB_KIND = agent-browser`；
+  重载后在同一 slot key 上重新注册 body，DSH 直接复用原 tab。
+- **启动清理旧标签**：`staleTabIds()`（纯函数，可测）从 `ctx.sidebarRight.openTabs` 快照里
+  挑出旧随机 id/kind 的 tab，`ctx.sidebarRight.close(id)` 关闭；1.5s 与 6s 各跑一次
+  （布局恢复时序），已关闭的 id 去重。用户现有的黑标签会在重启后自动清掉。
+- **挂载重试**：`appendAndWaitAttach()` 最多 3 次、每次 3.2s；每次重试 re-append guest
+  （强制 Electron attach）并重跑 `ensurePanel()`（`openTab(kind, { revealIfOpened: true })`
+  重新选中 tab）。三次都失败才抛错。
+- **最后兜底**：`ensurePanelReady` 在 remount 仍失败后调用 `resetPanel()`（关闭我们的 tab +
+  重开）再等 4s，最后才回退浮动面板；错误文案仍带 close/open 指引。
+- 全过程 diag：`attach-attempt`（每次 attempt/attached）、`stale-tabs-closed`（closed/total）、
+  `panel-tab-reset` / `panel-tab-reset-ready` / `panel-tab-reset-failed`。
+- 测试：`staleTabIds` 过滤（只关旧随机 tab，不碰稳定 tab 与其它插件）、apply 清理（去重）、
+  attach 重试（同一元素 re-append、ensurePanel 再跑、ready 后成功）、既有 stale 恢复与最终错误文案；
+  共 **122 项全绿**。
+- 真机复验（重启后）：黑标签被清理、`browser open` 一次成功、随后重跑 fullPage/picture/scrollbars/高元素。

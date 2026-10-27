@@ -295,11 +295,67 @@ test("registers the Agent Browser tab type and body slot", () => {
   const harness = makeContext();
   plugin.apply(harness.ctx);
   assert.equal(harness.tabTypes.length, 1);
-  assert.ok(harness.tabTypes[0].kind.startsWith("agent-browser-"), `kind must be unique per load, got ${harness.tabTypes[0].kind}`);
+  assert.equal(harness.tabTypes[0].kind, "agent-browser", "the kind must be stable across reloads (one reusable tab)");
+  assert.equal(harness.tabTypes[0].id, "@local/dsh-sidebar-browser-control", "the type id must be stable too");
   assert.equal(typeof harness.tabTypes[0].title, "function");
   assert.equal(harness.slotRegistrations.length, 1);
   assert.equal(harness.slotRegistrations[0].configuration.key, harness.tabTypes[0].id);
   harness.disposeAll();
+});
+
+test("legacy per-load tabs are identified for cleanup and current tabs are kept", () => {
+  const { plugin } = loadClientBundle(clientFile);
+  const staleTabIds = plugin.__test.staleTabIds;
+  const tabs = [
+    { id: "@local/dsh-sidebar-browser-control-abc123", kind: "agent-browser-abc123" },
+    { id: "@local/dsh-sidebar-browser-control-def456", kind: "agent-browser-def456" },
+    { id: "@local/dsh-sidebar-browser-control", kind: "agent-browser" },
+    { id: "@deepseek-ai/dsh-client-ui-sidebar-browser", kind: "browser" },
+    { id: "session-tab-1", kind: "temporary" },
+  ];
+  assert.deepEqual(
+    [...staleTabIds(tabs)],
+    ["@local/dsh-sidebar-browser-control-abc123", "@local/dsh-sidebar-browser-control-def456"],
+    "only tabs minted by older builds are closed; the stable tab and other plugins stay",
+  );
+  assert.deepEqual([...staleTabIds(undefined)], []);
+  assert.deepEqual([...staleTabIds([{ kind: "agent-browser-old" }])], [], "entries without an id are ignored");
+});
+
+test("apply closes legacy tabs left by older builds", () => {
+  const { plugin, makeContext, flushTimers } = loadClientBundle(clientFile);
+  const harness = makeContext({
+    openTabs: [
+      { id: "@local/dsh-sidebar-browser-control-abc123", kind: "agent-browser-abc123" },
+      { id: "@local/dsh-sidebar-browser-control", kind: "agent-browser" },
+    ],
+  });
+  plugin.apply(harness.ctx);
+  flushTimers();
+  assert.deepEqual([...harness.closedTabs], ["@local/dsh-sidebar-browser-control-abc123"]);
+  harness.disposeAll();
+});
+
+test("controller re-appends the guest and retries attach when the first attempt never fires", async () => {
+  const { webview } = makeWebviewMock();
+  const { desktop } = makeDshDesktop();
+  const built = makeController({ webview: () => webview, desktop });
+  const container = built.loaded.context.document.createElement("div");
+  const mountPromise = built.controller.mount(container);
+  await flushMicrotasks();
+  assert.equal(container.children.filter((child) => child.tagName === "WEBVIEW").length, 1);
+  built.loaded.flushTimers(); // attempt 1 times out -> detach + re-append + re-select the tab
+  await flushMicrotasks();
+  assert.equal(
+    container.children.filter((child) => child.tagName === "WEBVIEW").length,
+    1,
+    "the same guest element is re-appended, not duplicated",
+  );
+  assert.ok(built.ensurePanelCalls() >= 1, "a retry re-runs the panel ensure path to select the tab");
+  container.children.find((child) => child.tagName === "WEBVIEW").dispatch("dom-ready", {});
+  await mountPromise;
+  assert.equal(built.controller.status().ready, true);
+  built.controller.unmount();
 });
 
 test("controller mounts a leased webview and resolves on dom-ready", async () => {
@@ -1138,10 +1194,13 @@ test("open recovers once from a stale panel whose webview never becomes ready", 
   const container = loaded.context.document.createElement("div");
   controller.mount(container).catch(() => {});
   await flushMicrotasks();
-  // The first webview never fires dom-ready: trip its 2.5s ready wait (and the
-  // attach cap, which fires in the same drain).
-  loaded.flushTimers();
-  await flushMicrotasks();
+  // The first webview never fires dom-ready: run its three attach attempts and
+  // the 2.5s ready wait until the stale recovery remounts a fresh guest.
+  for (let i = 0; i < 12; i += 1) {
+    loaded.flushTimers();
+    await flushMicrotasks();
+    if (container.children.filter((child) => child.tagName === "WEBVIEW").length >= 2) break;
+  }
   const webviews = container.children.filter((child) => child.tagName === "WEBVIEW");
   assert.equal(webviews.length, 2, "the stale guest must be unmounted and a fresh one mounted into the same container");
   assert.equal(state.acquireCalls, 2, "exactly one remount: two leases in total");
@@ -1156,6 +1215,11 @@ test("open recovers once from a stale panel whose webview never becomes ready", 
     .map((call) => JSON.parse(String(call.init?.body ?? "{}")))
     .filter((body) => body?.value?.phase === "stale-remounted");
   assert.ok(remountDiags.length >= 1, "the recovery should record a stale-remounted diagnostic");
+  const attachDiags = loaded.fetchCalls
+    .filter((call) => call.url.includes("/diag"))
+    .map((call) => JSON.parse(String(call.init?.body ?? "{}")))
+    .filter((body) => body?.value?.phase === "attach-attempt");
+  assert.ok(attachDiags.length >= 2, "the mount should retry the guest attach and record each attempt");
   controller.unmount();
 });
 
@@ -1168,12 +1232,11 @@ test("open surfaces a close/open recovery hint after one remount and the floatin
   const container = loaded.context.document.createElement("div");
   controller.mount(container).catch(() => {});
   await flushMicrotasks();
-  loaded.flushTimers(); // trip the first waitReady + first attach cap
-  await flushMicrotasks(); // stale detection: unmount + second mount starts
-  loaded.flushTimers(); // trip the second attach cap (remount never ready)
-  await flushMicrotasks(); // floating fallback is unavailable -> final waitReady
-  loaded.flushTimers(); // trip the final waitReady
-  await flushMicrotasks();
+  // Neither mount ever attaches: drain the attach retries and both ready waits.
+  for (let i = 0; i < 20; i += 1) {
+    loaded.flushTimers();
+    await flushMicrotasks();
+  }
   await assert.rejects(
     () => openPromise,
     /close the Agent Browser tab and call action=open/,

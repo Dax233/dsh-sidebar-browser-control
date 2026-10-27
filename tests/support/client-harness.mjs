@@ -77,6 +77,12 @@ function makeElement(tag = "div") {
       this.children.push(child);
       return child;
     },
+    removeChild(child) {
+      const index = this.children.indexOf(child);
+      if (index < 0) throw new Error("the node to be removed is not a child of this node");
+      this.children.splice(index, 1);
+      return child;
+    },
     setAttribute(name, value) {
       this.attributes[name] = String(value);
     },
@@ -242,6 +248,7 @@ export function loadClientBundle(clientFile, options = {}) {
     const slotInjections = [];
     const slotRegistrations = [];
     const openTabCalls = [];
+    const closedTabs = [];
     const effectDisposers = [];
     const ctx = {
       effect(execute) {
@@ -261,6 +268,19 @@ export function loadClientBundle(clientFile, options = {}) {
           if (overrides.openTab) return overrides.openTab(...args);
           return undefined;
         },
+        close(tabId) {
+          closedTabs.push(tabId);
+          if (overrides.close) return overrides.close(tabId);
+          return undefined;
+        },
+        ...(overrides.openTabs === undefined
+          ? {}
+          : {
+              openTabs: {
+                getSnapshot: () => overrides.openTabs,
+                subscribe: () => () => {},
+              },
+            }),
       },
       slots: {
         inject(name, callback) {
@@ -281,6 +301,7 @@ export function loadClientBundle(clientFile, options = {}) {
       slotInjections,
       slotRegistrations,
       openTabCalls,
+      closedTabs,
       effectDisposers,
       disposeAll() {
         for (const dispose of effectDisposers.splice(0).reverse()) dispose();

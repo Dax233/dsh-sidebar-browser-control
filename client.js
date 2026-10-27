@@ -11,14 +11,36 @@ window.__ModuleLoader__.load({
     // real site can reach several MB base64, so fail with guidance instead of
     // letting the bridge reject the body and the Host report a bare timeout.
     const MAX_RESULT_CHARS = 48 * 1024 * 1024;
-    // A plugin reload disposes the old body but DSH keeps its tab entry; opening
-    // the same kind would only focus that stale, bodiless tab. A per-module-load
-    // identity guarantees openTab places a fresh tab whose body mounts.
-    const TAB_SUFFIX = Math.random().toString(36).slice(2, 8);
-    const TAB_ID = `@local/dsh-sidebar-browser-control-${TAB_SUFFIX}`;
-    const TAB_KIND = `agent-browser-${TAB_SUFFIX}`;
+    // Stable tab identity. An earlier build minted a random suffix per module
+    // load to dodge "stale bodiless tab" reuse, but that leaves one dead tab per
+    // restart in the persisted right-sidebar layout (the black tabs users see)
+    // and made every open create yet another tab. A stable id/kind lets DSH
+    // reuse the same tab and remount its body after a reload; legacy suffixed
+    // tabs are closed on startup (see staleTabIds/closeStaleTabs).
+    const TAB_ID = "@local/dsh-sidebar-browser-control";
+    const TAB_KIND = "agent-browser";
+    const LEGACY_TAB_ID_PREFIX = "@local/dsh-sidebar-browser-control-";
+    const LEGACY_TAB_KIND_PREFIX = "agent-browser-";
     const WORKSPACE_KEY = "agent-browser";
     const DEFAULT_WAIT_MS = 10000;
+
+    /**
+     * Tab ids that belong to older builds of this plugin and should be closed.
+     * Kept pure so the persisted-layout cleanup is unit-testable.
+     */
+    function staleTabIds(tabs, current = { id: TAB_ID, kind: TAB_KIND }) {
+      const list = Array.isArray(tabs) ? tabs : [];
+      const ids = [];
+      for (const tab of list) {
+        const id = typeof tab?.id === "string" ? tab.id : typeof tab?.tabId === "string" ? tab.tabId : undefined;
+        const kind = typeof tab?.kind === "string" ? tab.kind : undefined;
+        if (id === undefined) continue;
+        const legacyId = id !== current.id && id.startsWith(LEGACY_TAB_ID_PREFIX);
+        const legacyKind = kind !== undefined && kind !== current.kind && kind.startsWith(LEGACY_TAB_KIND_PREFIX);
+        if (legacyId || legacyKind) ids.push(id);
+      }
+      return ids;
+    }
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1246,6 +1268,8 @@ window.__ModuleLoader__.load({
       const decodeTimeoutMs = options.decodeTimeoutMs ?? 1500;
       const fullPageBudgetMs = options.fullPageBudgetMs ?? 60000;
       const viewportSettleMs = options.viewportSettleMs ?? 2000;
+      /** Closes our right-sidebar tab (if any) and re-opens it; last-resort reset. */
+      const resetPanel = typeof options.resetPanel === "function" ? options.resetPanel : undefined;
 
       let webview;
       let lease;
@@ -1317,6 +1341,70 @@ window.__ModuleLoader__.load({
         });
       }
 
+      /**
+       * Append the guest and wait for `dom-ready`, retrying the attach.
+       *
+       * A real restart (0.2.6, 2026-10-27) showed the tab body mounting while
+       * the leased <webview> never attached for 10s (black panel, then the
+       * stale-remount also failed); the next remount attached instantly.
+       * Detaching and re-appending forces Electron to attach the guest, and
+       * re-running the panel-ensure path re-selects the right-sidebar tab.
+       */
+      async function appendAndWaitAttach(element, container) {
+        const attemptMs = 3200;
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          if (attempt === 1) {
+            container.appendChild(element);
+          } else {
+            try {
+              ensurePanel();
+            } catch {
+              // Best effort: the tab may already be selected.
+            }
+            try {
+              if (typeof container.removeChild === "function") container.removeChild(element);
+            } catch {
+              // The element may already be detached.
+            }
+            try {
+              container.appendChild(element);
+            } catch {
+              // A vanished container fails the wait below.
+            }
+          }
+          const attached = await new Promise((resolve) => {
+            let done = false;
+            const onReady = () => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              resolve(true);
+            };
+            const timer = setTimeout(() => {
+              if (done) return;
+              done = true;
+              try {
+                element.removeEventListener("dom-ready", onReady);
+              } catch {
+                // Fake guests in tests may not implement removeEventListener.
+              }
+              resolve(false);
+            }, attemptMs);
+            element.addEventListener("dom-ready", onReady, { once: true });
+          });
+          void postDiag("panel", { phase: "attach-attempt", attempt, attached });
+          if (attached) {
+            settleReady();
+            return;
+          }
+        }
+        throw new Error(
+          `Agent Browser webview did not attach after ${maxAttempts} attempts (the right-sidebar tab may be stale); ` +
+            "close the Agent Browser tab and call action=open again",
+        );
+      }
+
       async function mount(container) {
         if (ready) return;
         if (mountPromise !== undefined) return mountPromise;
@@ -1373,19 +1461,7 @@ window.__ModuleLoader__.load({
           element.addEventListener("dom-ready", () => {
             void postDiag("panel", { phase: "dom-ready", url: safePageUrl(element) });
           });
-          await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error("Agent Browser webview did not attach within 10s")), 10000);
-            element.addEventListener(
-              "dom-ready",
-              () => {
-                clearTimeout(timer);
-                settleReady();
-                resolve();
-              },
-              { once: true },
-            );
-            container.appendChild(element);
-          });
+          await appendAndWaitAttach(element, container);
           if (themeState !== "auto") {
             // A fresh about:blank context must carry the current emulation.
             try {
@@ -2131,6 +2207,20 @@ window.__ModuleLoader__.load({
             return;
           } catch (error) {
             firstError = error;
+          }
+        }
+        if (resetPanel !== undefined) {
+          // A wedged right-sidebar tab can keep a wedged body even after a
+          // remount; dropping our tab and opening a fresh one is the last
+          // in-app recovery before the floating fallback.
+          try {
+            const closed = resetPanel();
+            void postDiag("panel", { phase: "panel-tab-reset", closed });
+            await waitReady(4000);
+            void postDiag("panel", { phase: "panel-tab-reset-ready" });
+            return;
+          } catch (error) {
+            void postDiag("panel", { phase: "panel-tab-reset-failed", error: String(error && error.message ? error.message : error) });
           }
         }
         try {
@@ -2942,6 +3032,33 @@ window.__ModuleLoader__.load({
             document: globalThis.document,
             dshDesktop: globalThis.dshDesktop,
             ensureFallback,
+            resetPanel: () => {
+              let closed = 0;
+              try {
+                const openTabs = ctx.sidebarRight?.openTabs;
+                const snapshot =
+                  openTabs !== undefined && typeof openTabs.getSnapshot === "function" ? openTabs.getSnapshot() : undefined;
+                for (const tab of Array.isArray(snapshot) ? snapshot : []) {
+                  const id = typeof tab?.id === "string" ? tab.id : undefined;
+                  if (id === undefined) continue;
+                  if (tab.kind !== TAB_KIND && id !== TAB_ID) continue;
+                  try {
+                    ctx.sidebarRight.close(id);
+                    closed += 1;
+                  } catch {
+                    // Already gone.
+                  }
+                }
+              } catch {
+                // Opening a fresh tab below still has a chance.
+              }
+              try {
+                ctx.sidebarRight?.openTab?.(TAB_KIND, { revealIfOpened: true });
+              } catch {
+                // The floating fallback still applies.
+              }
+              return closed;
+            },
             ensurePanel: () => {
               // A collapsed right sidebar can accept openTab without mounting the
               // body; expand it first so the webview actually becomes ready.
@@ -2952,7 +3069,10 @@ window.__ModuleLoader__.load({
                 info.layoutError = String(error && error.message ? error.message : error);
               }
               try {
-                ctx.sidebarRight.openTab(TAB_KIND);
+                // revealIfOpened activates the existing tab: a body that mounts
+                // while the tab is not selected can leave the guest unattached
+                // (black panel until the next remount).
+                ctx.sidebarRight.openTab(TAB_KIND, { revealIfOpened: true });
                 info.opened = TAB_KIND;
               } catch (error) {
                 info.openError = String(error && error.message ? error.message : error);
@@ -2986,6 +3106,42 @@ window.__ModuleLoader__.load({
               ),
             "sidebar-browser-control.tab-body",
           );
+          // Older builds minted a random tab kind per module load. Those tabs
+          // stay in the persisted right-sidebar layout with no body and render
+          // as black panes; close them now that the tab identity is stable.
+          const closedLegacyTabs = new Set();
+          const closeStaleTabs = () => {
+            try {
+              const openTabs = ctx.sidebarRight?.openTabs;
+              const snapshot =
+                openTabs !== undefined && typeof openTabs.getSnapshot === "function" ? openTabs.getSnapshot() : undefined;
+              const ids = staleTabIds(snapshot);
+              let closed = 0;
+              for (const id of ids) {
+                if (closedLegacyTabs.has(id)) continue;
+                closedLegacyTabs.add(id);
+                try {
+                  ctx.sidebarRight.close(id);
+                  closed += 1;
+                } catch {
+                  // Already closed or not closable in this build.
+                }
+              }
+              void postDiag("panel", {
+                phase: "stale-tabs-closed",
+                closed,
+                total: Array.isArray(snapshot) ? snapshot.length : 0,
+              });
+            } catch (error) {
+              void postDiag("panel", { phase: "stale-tabs-cleanup-failed", error: String(error && error.message ? error.message : error) });
+            }
+          };
+          const cleanupTimer = setTimeout(closeStaleTabs, 1500);
+          const cleanupTimer2 = setTimeout(closeStaleTabs, 6000);
+          ctx.effect(() => () => {
+            clearTimeout(cleanupTimer);
+            clearTimeout(cleanupTimer2);
+          }, "sidebar-browser-control.stale-tabs");
           // Fire-and-forget: never return this promise from apply (boot contract).
           const loop = createBridgeLoop(controller, lifetime.signal);
           loop.catch((error) => {
@@ -2997,6 +3153,7 @@ window.__ModuleLoader__.load({
       },
       __test: {
         createPanelController,
+        staleTabIds,
         rewriteColorSchemeQuery,
         injectBaseHref,
         clampRect,

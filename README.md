@@ -87,6 +87,19 @@ browser close
 
 ## Limits (honest boundaries)
 
+- **The panel tab has a stable identity (0.2.7).** Earlier builds minted a random
+  tab `kind`/`id` per module load to avoid reusing a stale, bodiless tab; that
+  left one dead tab per restart in the persisted right-sidebar layout (the black
+  empty panes). 0.2.7 uses one stable `agent-browser` tab, closes tabs left by
+  older builds on startup (`ctx.sidebarRight.openTabs` + `close`), and remounts
+  the body under the same slot key after a reload.
+- **Guest attach is retried (0.2.7).** A real restart showed the tab body mounting
+  while the leased `<webview>` never attached for 10s (black panel, no `dom-ready`;
+  the next remount attached instantly). `mount` now detaches/re-appends the guest
+  up to three attempts, re-runs the panel-ensure path to re-select the tab on each
+  retry, and — if the tab still stays wedged — closes our tab and opens a fresh
+  one before falling back to the floating panel. Stage diagnostics
+  (`attach-attempt`, `panel-tab-reset`, `stale-tabs-closed`) are in the diag state.
 - **DPR / deviceScaleFactor is not emulated.** A renderer-side `<webview>` only
   exposes DOM APIs, not `webContents.debugger`, so `Emulation.setDeviceMetricsOverride`
   is unreachable. The plugin never fakes a 2x image: receipts report the real
