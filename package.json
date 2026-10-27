@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-sidebar-browser-control",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "private": true,
   "type": "module",
   "description": "Sidebar Agent Browser for DeepSeek Harness: an owned webview plus Agent tools (snapshot/click/type/scroll) driven through a loopback bridge, with an in-page virtual cursor that never moves the user's real mouse, plus QA actions for viewport/evaluate/metrics/screenshots/theme emulation and local preview.",
@@ -50,3 +50,4 @@
     "node": ">=22"
   }
 }
+

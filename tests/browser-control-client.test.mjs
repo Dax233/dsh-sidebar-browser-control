@@ -336,26 +336,43 @@ test("apply closes legacy tabs left by older builds", () => {
   harness.disposeAll();
 });
 
-test("controller re-appends the guest and retries attach when the first attempt never fires", async () => {
+test("controller replaces a wedged guest and retries attach when the first attempt never fires", async () => {
   const { webview } = makeWebviewMock();
   const { desktop } = makeDshDesktop();
   const built = makeController({ webview: () => webview, desktop });
   const container = built.loaded.context.document.createElement("div");
   const mountPromise = built.controller.mount(container);
   await flushMicrotasks();
-  assert.equal(container.children.filter((child) => child.tagName === "WEBVIEW").length, 1);
-  built.loaded.flushTimers(); // attempt 1 times out -> detach + re-append + re-select the tab
+  const first = container.children.find((child) => child.tagName === "WEBVIEW");
+  assert.ok(first, "attempt 1 appends a guest");
+  built.loaded.flushTimers(); // attempt 1 times out -> rebuild + re-select the tab
   await flushMicrotasks();
-  assert.equal(
-    container.children.filter((child) => child.tagName === "WEBVIEW").length,
-    1,
-    "the same guest element is re-appended, not duplicated",
-  );
+  const guests = container.children.filter((child) => child.tagName === "WEBVIEW");
+  assert.equal(guests.length, 1, "only the current guest stays in the container");
+  assert.notEqual(guests[0], first, "a wedged guest is replaced, not re-appended");
   assert.ok(built.ensurePanelCalls() >= 1, "a retry re-runs the panel ensure path to select the tab");
-  container.children.find((child) => child.tagName === "WEBVIEW").dispatch("dom-ready", {});
+  guests[0].dispatch("dom-ready", {});
   await mountPromise;
   assert.equal(built.controller.status().ready, true);
   built.controller.unmount();
+});
+
+test("a command rebuilds the guest when the ready flag outlives a detached webview", async () => {
+  const mounted = await mountController({ webviewOptions: {} });
+  const stale = mounted.element;
+  stale.isConnected = false; // e.g. a failed mount raced a remount
+  const promise = mounted.controller.handle({ type: "evaluate", expression: "1+1" });
+  let fresh;
+  for (let attempt = 0; attempt < 8 && fresh === undefined; attempt += 1) {
+    await flushMicrotasks();
+    fresh = mounted.container.children.find((child) => child.tagName === "WEBVIEW" && child !== stale);
+  }
+  assert.ok(fresh, "the detached guest must be replaced before the command runs");
+  fresh.dispatch("dom-ready", {});
+  await flushMicrotasks();
+  const result = await promise;
+  assert.equal(result.ok, true);
+  mounted.controller.unmount();
 });
 
 test("controller mounts a leased webview and resolves on dom-ready", async () => {

@@ -1341,62 +1341,109 @@ window.__ModuleLoader__.load({
         });
       }
 
+      /** Build one leased guest element with all listeners; the caller appends it. */
+      function createGuestElement(reservation) {
+        const element = documentRef.createElement("webview");
+        webview = element;
+        element.setAttribute("name", reservation.lease);
+        element.setAttribute("partition", reservation.partition);
+        element.setAttribute("src", `about:blank#${reservation.lease}`);
+        element.style.cssText = "width:100%;height:100%;display:flex;background:#0b0d12";
+        if (viewportState !== undefined) applyViewportStyle(viewportState);
+        element.addEventListener("did-navigate", () => {
+          // A new document means the previous snapshot refs are gone.
+          lastSnapshot = undefined;
+          settleNavigation();
+          lastNavigation = { url: safePageUrl(element), title: "" };
+        });
+        element.addEventListener("console-message", (event) => {
+          recordConsoleMessage(event);
+        });
+        // Lifecycle diagnostics: a panel can stop polling without an error
+        // (guest crash, lease teardown, host unmount). Record why it happened.
+        for (const eventName of ["crashed", "destroyed", "render-process-gone", "unresponsive"]) {
+          element.addEventListener(eventName, () => {
+            void postDiag("panel", { phase: "webview-event", event: eventName, lease: lease ?? null });
+          });
+        }
+        element.addEventListener("did-fail-load", (event) => {
+          void postDiag("panel", {
+            phase: "did-fail-load",
+            errorCode: event?.errorCode,
+            errorDescription: event?.errorDescription,
+            validatedURL: event?.validatedURL,
+          });
+        });
+        element.addEventListener("dom-ready", () => {
+          void postDiag("panel", { phase: "dom-ready", url: safePageUrl(element) });
+        });
+        return element;
+      }
+
+      /** Resolve true when the guest emits dom-ready before the timeout. */
+      function waitForGuestReady(element, timeoutMs) {
+        return new Promise((resolve) => {
+          let done = false;
+          const onReady = () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            resolve(true);
+          };
+          const timer = setTimeout(() => {
+            if (done) return;
+            done = true;
+            try {
+              element.removeEventListener("dom-ready", onReady);
+            } catch {
+              // Fake guests in tests may not implement removeEventListener.
+            }
+            resolve(false);
+          }, timeoutMs);
+          element.addEventListener("dom-ready", onReady, { once: true });
+        });
+      }
+
       /**
-       * Append the guest and wait for `dom-ready`, retrying the attach.
+       * Append a leased guest and wait for `dom-ready`, REPLACING the element on
+       * every retry.
        *
-       * A real restart (0.2.6, 2026-10-27) showed the tab body mounting while
-       * the leased <webview> never attached for 10s (black panel, then the
-       * stale-remount also failed); the next remount attached instantly.
-       * Detaching and re-appending forces Electron to attach the guest, and
-       * re-running the panel-ensure path re-selects the right-sidebar tab.
+       * A real restart (2026-10-27) showed three attach attempts on the same
+       * element fail while the next fresh mount attached in 2ms: a wedged guest
+       * is repaired by rebuilding it, not by re-appending it. Each retry also
+       * re-runs the panel-ensure path so the right-sidebar tab stays selected.
        */
-      async function appendAndWaitAttach(element, container) {
+      async function mountGuest(container, reservation) {
         const attemptMs = 3200;
         const maxAttempts = 3;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-          if (attempt === 1) {
+          const element = createGuestElement(reservation);
+          try {
             container.appendChild(element);
-          } else {
-            try {
-              ensurePanel();
-            } catch {
-              // Best effort: the tab may already be selected.
-            }
-            try {
-              if (typeof container.removeChild === "function") container.removeChild(element);
-            } catch {
-              // The element may already be detached.
-            }
-            try {
-              container.appendChild(element);
-            } catch {
-              // A vanished container fails the wait below.
-            }
+          } catch {
+            // A vanished container fails the wait below.
           }
-          const attached = await new Promise((resolve) => {
-            let done = false;
-            const onReady = () => {
-              if (done) return;
-              done = true;
-              clearTimeout(timer);
-              resolve(true);
-            };
-            const timer = setTimeout(() => {
-              if (done) return;
-              done = true;
-              try {
-                element.removeEventListener("dom-ready", onReady);
-              } catch {
-                // Fake guests in tests may not implement removeEventListener.
-              }
-              resolve(false);
-            }, attemptMs);
-            element.addEventListener("dom-ready", onReady, { once: true });
-          });
+          const attached = await waitForGuestReady(element, attemptMs);
           void postDiag("panel", { phase: "attach-attempt", attempt, attached });
           if (attached) {
             settleReady();
-            return;
+            return element;
+          }
+          try {
+            if (typeof container.removeChild === "function") container.removeChild(element);
+          } catch {
+            // Already detached.
+          }
+          try {
+            element.remove?.();
+          } catch {
+            // Already removed.
+          }
+          if (webview === element) webview = undefined;
+          try {
+            ensurePanel();
+          } catch {
+            // Best effort: the tab may already be selected.
           }
         }
         throw new Error(
@@ -1427,41 +1474,7 @@ window.__ModuleLoader__.load({
           } catch {
             // Mock containers in tests use plain objects.
           }
-          const element = documentRef.createElement("webview");
-          webview = element;
-          element.setAttribute("name", reservation.lease);
-          element.setAttribute("partition", reservation.partition);
-          element.setAttribute("src", `about:blank#${reservation.lease}`);
-          element.style.cssText = "width:100%;height:100%;display:flex;background:#0b0d12";
-          if (viewportState !== undefined) applyViewportStyle(viewportState);
-          element.addEventListener("did-navigate", () => {
-            // A new document means the previous snapshot refs are gone.
-            lastSnapshot = undefined;
-            settleNavigation();
-            lastNavigation = { url: safePageUrl(element), title: "" };
-          });
-          element.addEventListener("console-message", (event) => {
-            recordConsoleMessage(event);
-          });
-          // Lifecycle diagnostics: a panel can stop polling without an error
-          // (guest crash, lease teardown, host unmount). Record why it happened.
-          for (const eventName of ["crashed", "destroyed", "render-process-gone", "unresponsive"]) {
-            element.addEventListener(eventName, () => {
-              void postDiag("panel", { phase: "webview-event", event: eventName, lease: lease ?? null });
-            });
-          }
-          element.addEventListener("did-fail-load", (event) => {
-            void postDiag("panel", {
-              phase: "did-fail-load",
-              errorCode: event?.errorCode,
-              errorDescription: event?.errorDescription,
-              validatedURL: event?.validatedURL,
-            });
-          });
-          element.addEventListener("dom-ready", () => {
-            void postDiag("panel", { phase: "dom-ready", url: safePageUrl(element) });
-          });
-          await appendAndWaitAttach(element, container);
+          const element = await mountGuest(container, reservation);
           if (themeState !== "auto") {
             // A fresh about:blank context must carry the current emulation.
             try {
@@ -1607,12 +1620,61 @@ window.__ModuleLoader__.load({
         await ensureMounted(container);
       }
 
+      /**
+       * Whether the guest element is really attached. Electron throws
+       * "The WebView must be attached to the DOM and the dom-ready event
+       * emitted before this method can be called" when a method is used on a
+       * guest that failed to attach, so probe it before issuing commands.
+       */
+      function guestAttached(element) {
+        if (element === undefined || element === null) return false;
+        try {
+          if (element.isConnected === false) return false;
+          if (typeof element.getWebContentsId === "function") element.getWebContentsId();
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
       async function requireReady() {
-        if (ready && webview !== undefined) return webview;
+        if (ready && webview !== undefined && guestAttached(webview)) return webview;
         if (webview === undefined) throw new Error("Agent Browser panel is not open; call action=open first");
+        if (ready && !guestAttached(webview)) {
+          // A ready flag can outlive its guest (failed mount racing a remount):
+          // rebuild the guest instead of issuing commands on a detached one.
+          void postDiag("panel", { phase: "ready-guest-detached", geometry: panelGeometry() });
+          const container = lastMountContainer;
+          unmount();
+          if (container !== undefined) await ensureMounted(container);
+        }
         await waitReady();
         if (webview === undefined) throw new Error("Agent Browser panel was closed");
+        if (!guestAttached(webview)) throw new Error("Agent Browser webview is not attached; call action=open again");
         return webview;
+      }
+
+      /**
+       * Navigate with one recovery pass: a guest that lost its attach raises
+       * Electron's "must be attached ... dom-ready" error, so rebuild it once
+       * instead of surfacing that raw error to the caller.
+       */
+      async function loadUrlWithRecovery(url) {
+        const current = await requireReady();
+        try {
+          await current.loadURL(url);
+          return current;
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error);
+          if (!/must be attached/iu.test(message)) throw error;
+          void postDiag("panel", { phase: "loadurl-detached-retry", error: message });
+          const container = lastMountContainer;
+          unmount();
+          if (container !== undefined) await ensureMounted(container);
+          const retried = await requireReady();
+          await retried.loadURL(url);
+          return retried;
+        }
       }
 
       /** Observations settle after an action; navigation can destroy the page context. */
@@ -2324,8 +2386,7 @@ window.__ModuleLoader__.load({
           case "open": {
             const url = toHttpUrl(command.url);
             await ensurePanelReady();
-            const current = await requireReady();
-            await current.loadURL(url);
+            const current = await loadUrlWithRecovery(url);
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
             await afterNavigation(current, info, url);
@@ -2334,8 +2395,7 @@ window.__ModuleLoader__.load({
           case "navigate": {
             const url = toHttpUrl(command.url);
             await ensurePanelReady();
-            const current = await requireReady();
-            await current.loadURL(url);
+            const current = await loadUrlWithRecovery(url);
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
             await afterNavigation(current, info, url);
@@ -3234,3 +3294,4 @@ window.__ModuleLoader__.load({
     };
   },
 });
+

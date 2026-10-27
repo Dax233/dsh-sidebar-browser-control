@@ -932,3 +932,24 @@ diag 事件链为 `mount-acquired → webview did not attach within 10s（mount-
   getBoundingClientRect。共 **124 项全绿**。
 - 真机复验（重启后）：用 CopyFromScreen 抓 DSH 窗口，确认右侧面板是否显示页面；
   同时用 `browser status` 的 `panel` 字段核对容器/元素几何。
+
+### 34.13 重启后首次 open 失败与「换元素」重试（2026-10-27，0.2.8 → 0.2.9）
+
+0.2.8 重启后第一次 `browser open` 失败，报 Electron 的
+`The WebView must be attached to the DOM and the dom-ready event emitted before this method can be called`。
+diag：`attach-attempt 1/2/3 attached:false` → `mount-failed` → `stale-remount-failed` →
+`panel-tab-reset` → 之后 React 又自己挂了一次（2ms 成功）。
+
+结论：**同一元素 re-append 救不回 wedged guest**；真机证据是"重建元素"（新 webview）
+立刻 attach（2ms）。所以：
+
+- `mountGuest()` 把重试改成**每次新建 webview 元素**（旧元素移除并 `remove()`），
+  仍保留 3 次 × 3.2s，并在重试时重跑 `ensurePanel()` 选中 tab；
+- 抽了 `createGuestElement()`（元素 + 全部事件监听），mount 只负责 acquire/loop/主题重放；
+- `requireReady()` 增加 `guestAttached()` 探针（isConnected + getWebContentsId）；
+  若 ready 标志还在但 guest 已 detached，会 `unmount()` 后立刻重建再等 ready；
+- `loadUrlWithRecovery()`：open/navigate 命中 `must be attached` 时重建一次再 loadURL，
+  不再把 Electron 原始错误抛给调用方；
+- 测试：换元素重试（新元素 ≠ 旧元素、容器只留一个）、ready-but-detached 时命令前自动重建；
+  共 **125 项全绿**。
+- 真机待验（重启后）：首次 open 一次成功；若 attach 首次失败应看到 attach-attempt 后自动恢复。
