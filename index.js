@@ -932,6 +932,7 @@ export function apply(ctx) {
           fullPage.capturedHeight ?? "?"
         } of ${fullPage.requestedHeight ?? "?"} CSS px` +
           (fullPage.capped === true ? " (capped at 12000; scroll and capture again for the rest)" : "") +
+          (fullPage.scrollbarsHidden === true ? "; page scrollbars hidden during capture" : "") +
           (fullPage.stitched === true ? "; position:fixed/sticky elements may repeat in the stitched image" : ""),
       );
     }

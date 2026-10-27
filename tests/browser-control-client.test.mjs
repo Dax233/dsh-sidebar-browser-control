@@ -32,6 +32,7 @@ function makeWebviewMock(options = {}) {
         return { editable: true, tag: "input", value: "deepseek harness" };
       }
       if (code.includes("__dshAgentCursorVisibility")) return { found: true, hidden: true, previous: "" };
+      if (code.includes("__dshAgentScrollbarVisibility")) return { hidden: code.includes("if (true)"), created: true };
       if (code.includes("__dshAgentCursorMove")) return { moved: true };
       if (code.includes("__dshAgentClickTarget")) {
         if (options.clickTargetError !== undefined) return { ok: false, error: options.clickTargetError };
@@ -876,9 +877,14 @@ test("screenshot fullPage stitches viewport captures without resizing the guest"
   assert.equal(result.fullPage.capturedHeight, 900);
   assert.equal(result.fullPage.capped, false);
   assert.equal(result.fullPage.stitched, true);
+  assert.equal(result.fullPage.scrollbarsHidden, true, "fullPage should hide page scrollbars while stitching");
   assert.equal(result.fullPage.segments, 2, "900 CSS px at a 742 px viewport needs two slices");
   assert.equal(captured.length, 2, "one normal-size capturePage per viewport slice");
   assert.equal(captured[0].height, undefined, "the guest must not be resized for fullPage");
+  const scrollbarCalls = mounted.calls.executeJavaScript.filter((code) => code.includes("__dshAgentScrollbarVisibility"));
+  assert.equal(scrollbarCalls.length, 2, "hide before stitching, restore afterwards");
+  assert.match(scrollbarCalls[0], /if \(true\)/);
+  assert.match(scrollbarCalls[1], /if \(false\)/);
   const canvas = mounted.loaded.elements.find((element) => Array.isArray(element.__draws) && element.__draws.length > 0);
   assert.ok(canvas, "the stitched image must be drawn into a canvas");
   assert.equal(canvas.height, 900);

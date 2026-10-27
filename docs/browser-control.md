@@ -563,12 +563,12 @@ token 移出 WS query。
 
 0.1.24 受控复验（2026-10-24）：点击 iframe 内 `GO TO INNER TWO` 输出 `(iframe script click)` 且无 no-observable-change 提示；`contentDocument.location.href` = `/inner2.html`，title/h1 = `Inner Two`。
 
-## 34. QA 能力（2026-10-26，0.1.0 → 0.2.2）
+## 34. QA 能力（2026-10-26，0.1.0 → 0.2.3）
 
 背景见 `dsh-plugins/research/feedback-triage-2026-10-26.md` §1/§3/§5：真实工程验收（改 GitHub 主页后
 明/暗 × 桌面/手机 4 组验收）暴露了侧栏浏览器缺 viewport / evaluate / 资源等待 / 证据截图 / 批量回归，
 这些可以在「页面 JS + webview DOM API」内完成；DPR、媒体仿真、网络状态码与离屏/CI 需要 CDP 或
-Electron 主进程，**不在插件能力内，不做伪造**。0.2.1 / 0.2.2 是 0.2.0 真机首验后的修补（见 34.5）。
+Electron 主进程，**不在插件能力内，不做伪造**。0.2.1 / 0.2.2 / 0.2.3 是 0.2.0 真机首验后的修补（见 34.5–34.7）。
 
 ### 34.1 新增工具面
 
@@ -688,4 +688,21 @@ browser screenshot failed: Buffer is not available for the current Context
 `toDataURL()` 设为首选路径，`toPNG` 只在 try/catch 里做兼容；JPEG 若 `toJPEG()` 失败则用 canvas
 把 PNG 转 JPEG（质量参数保留）。回归测试覆盖「toPNG/toJPEG 抛 Buffer 错误但 toDataURL 正常」的
 sandbox 场景。截图相关的 fullPage/元素/clip/qa 待 0.2.2 重启后再验。
+
+### 34.7 第三轮真机（2026-10-27，0.2.2 → 0.2.3）
+
+0.2.2 重启后截图链路全部通过（真机 + 读图确认）：
+
+- `screenshot` viewport：390x844 PNG；
+- 元素截图（`#sec2 .badge`）：163x78 PNG；
+- clip 截图：300x300 PNG；
+- **fullPage：390x3500 PNG，逐屏拼接 5 段**，5 个 section/颜色/badge 全部对齐无接缝；
+- **`qa` 4 组矩阵全部成功**：375/1280 × light/dark，viewport 与 doc 宽度正确（360/1265 = 扣滚动条），
+  截图 375x3500 / 1280x3500，light/dark 配色正确，console/图片/字体指标齐全；
+- `preview` 本地目录 + token URL + 404 安全边界（上轮已验）。
+
+0.2.3 只做一个小改进：fullPage 拼接前**隐藏页面滚动条**（注入 `scrollbar-width:none` /
+`::-webkit-scrollbar{display:none}`，截完移除），这样每段不再带滚动条残影，内容宽度也不再有 15px
+偏差；回执 `fullPage.scrollbarsHidden` 如实标注。已知边界仍是 `position:fixed/sticky` 会重复。
+真机复验需再重启一次。
 

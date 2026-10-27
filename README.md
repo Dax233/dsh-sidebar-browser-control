@@ -99,12 +99,12 @@ browser close
 - **`fullPage` screenshot is scroll-stitched, not a guest resize.** On the first
   real-device run (2026-10-26) the earlier "grow the webview element then
   `capturePage()`" approach hung `capturePage()` forever and wedged the command
-  loop until DSH restarted. The current implementation scrolls one viewport at a
-  time, captures normal-size frames, and stitches them in a canvas (cap 12000
-  CSS px, reported as `capped`). `vh` layouts are no longer distorted, but
-  `position:fixed/sticky` elements can repeat in the stitched image. Every
-  `capturePage()` call is also bounded by a timeout, so a hanging capture returns
-  an error instead of freezing the panel.
+  loop until DSH restarted. The current implementation hides the page scrollbars,
+  scrolls one viewport at a time, captures normal-size frames, and stitches them
+  in a canvas (cap 12000 CSS px, reported as `capped`). `vh` layouts are no longer
+  distorted, but `position:fixed/sticky` elements can repeat in the stitched image.
+  Every `capturePage()` call is also bounded by a timeout, so a hanging capture
+  returns an error instead of freezing the panel.
 - **Screenshots use the sandbox-safe image path.** The DSH renderer has no Node
   integration, so Electron's `nativeImage.toPNG()/toJPEG()` throw "Buffer is not
   available for the current Context". Capture conversion therefore prefers

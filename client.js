@@ -590,6 +590,29 @@ window.__ModuleLoader__.load({
       })()`;
     }
 
+    /**
+     * Hide/show the page scrollbars while a full-page capture is stitched.
+     * Without this every viewport slice carries a scrollbar strip, and the
+     * stitched image is exactly viewportWidth wide only because of it.
+     */
+    function scrollbarVisibilityJs(hide) {
+      return `(() => {
+        // __dshAgentScrollbarVisibility
+        const ID = '__dshAgentHideScrollbars';
+        const existing = document.getElementById(ID);
+        if (${hide === true}) {
+          if (existing) return { hidden: true, created: false };
+          const style = document.createElement('style');
+          style.id = ID;
+          style.textContent = 'html{scrollbar-width:none!important}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important}';
+          (document.head || document.documentElement).appendChild(style);
+          return { hidden: true, created: true };
+        }
+        if (existing) { existing.remove(); return { hidden: false, removed: true }; }
+        return { hidden: false, removed: false };
+      })()`;
+    }
+
     /** Measure an element for a capturePage(rect) element screenshot. */
     function screenshotTargetJs(target = {}) {
       return `(async () => {
@@ -1462,16 +1485,27 @@ window.__ModuleLoader__.load({
         if (typeof current.capturePage !== "function") throw new Error("capturePage is not available in this webview");
         const format = options.format === "jpeg" ? "jpeg" : "png";
         const quality = options.quality;
-        const state = await current.executeJavaScript(scrollStateJs());
-        const viewport = await current.executeJavaScript(viewportInfoJs());
-        const requestedHeight = Math.max(1, Math.round(Number(state?.scrollHeight ?? 0)));
-        const viewportHeight = Math.max(1, Math.round(Number(state?.innerHeight ?? viewport?.innerHeight ?? 0)));
-        const viewportWidth = Math.max(1, Math.round(Number(viewport?.innerWidth ?? 0)));
-        const originalScrollY = Math.max(0, Math.round(Number(state?.scrollY ?? 0)));
-        const capturedHeight = Math.max(1, Math.min(requestedHeight, fullPageMaxCssPx));
-        const segments = [];
-        let targetY = 0;
+        let scrollbarsHidden = false;
+        let originalScrollY = 0;
         try {
+          // Hide scrollbars first: the layout width grows by the scrollbar
+          // width, so dimensions must be read after it is applied.
+          try {
+            const hidden = await current.executeJavaScript(scrollbarVisibilityJs(true));
+            scrollbarsHidden = hidden?.hidden === true;
+          } catch {
+            scrollbarsHidden = false;
+          }
+          if (scrollbarsHidden) await sleepImpl(60);
+          const state = await current.executeJavaScript(scrollStateJs());
+          const viewport = await current.executeJavaScript(viewportInfoJs());
+          const requestedHeight = Math.max(1, Math.round(Number(state?.scrollHeight ?? 0)));
+          const viewportHeight = Math.max(1, Math.round(Number(state?.innerHeight ?? viewport?.innerHeight ?? 0)));
+          const viewportWidth = Math.max(1, Math.round(Number(viewport?.innerWidth ?? 0)));
+          originalScrollY = Math.max(0, Math.round(Number(state?.scrollY ?? 0)));
+          const capturedHeight = Math.max(1, Math.min(requestedHeight, fullPageMaxCssPx));
+          const segments = [];
+          let targetY = 0;
           while (targetY < capturedHeight) {
             // `behavior: 'instant'` bypasses a page's `scroll-behavior: smooth`,
             // which would otherwise animate and make the capture frame lag.
@@ -1486,27 +1520,35 @@ window.__ModuleLoader__.load({
             if (actualY >= capturedHeight - viewportHeight) break;
             targetY += viewportHeight;
           }
+          const dataUrl = await stitchSegments(segments, viewportWidth, capturedHeight, viewportHeight, format, quality);
+          return {
+            dataUrl,
+            format,
+            fullPage: {
+              requestedHeight,
+              capturedHeight,
+              capped: requestedHeight > capturedHeight,
+              segments: segments.length,
+              stitched: true,
+              viewportHeight,
+              scrollbarsHidden,
+            },
+            viewportInfo: { innerWidth: viewportWidth, innerHeight: viewportHeight },
+          };
         } finally {
           try {
             await current.executeJavaScript(`(() => { window.scrollTo({ top: ${originalScrollY}, left: 0, behavior: 'instant' }); return 1; })()`);
           } catch {
             // The page may have navigated away mid-capture.
           }
+          if (scrollbarsHidden) {
+            try {
+              await current.executeJavaScript(scrollbarVisibilityJs(false));
+            } catch {
+              // The page may have navigated away mid-capture.
+            }
+          }
         }
-        const dataUrl = await stitchSegments(segments, viewportWidth, capturedHeight, viewportHeight, format, quality);
-        return {
-          dataUrl,
-          format,
-          fullPage: {
-            requestedHeight,
-            capturedHeight,
-            capped: requestedHeight > capturedHeight,
-            segments: segments.length,
-            stitched: true,
-            viewportHeight,
-          },
-          viewportInfo: { innerWidth: viewportWidth, innerHeight: viewportHeight },
-        };
       }
 
       /** Replay the best-effort theme shim after a page context was replaced. */
