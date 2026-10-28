@@ -315,6 +315,11 @@ function startFakeClient(port, received, isStopped, options = {}) {
             : {}),
           ...(options.statusAttemptedUrl !== undefined ? { attemptedUrl: options.statusAttemptedUrl } : {}),
           ...(options.statusHostOrigin !== undefined ? { hostOrigin: options.statusHostOrigin } : {}),
+          ...(options.statusLastLoadedAt !== undefined ? { lastLoadedAt: options.statusLastLoadedAt } : {}),
+          ...(options.statusContentSource !== undefined ? { contentSource: options.statusContentSource } : {}),
+          ...(options.statusLastLoadFailureStale !== undefined
+            ? { lastLoadFailureStale: options.statusLastLoadFailureStale }
+            : {}),
         };
       default:
         return { ok: true };
@@ -1070,5 +1075,71 @@ test("0.2.12 host: a client that never answers reports the wedged-panel hint", a
       // The fake client takes the command but never posts a result.
       { dropTypes: ["setContent"] },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.13 status freshness/content-source pass-through + preview no-index note.
+// ---------------------------------------------------------------------------
+
+test("0.2.13 host status: passes lastLoadedAt, contentSource and lastLoadFailureStale through", async () => {
+  const lastLoadedAt = 1_760_000_000_123;
+  const contentSource = "setContent";
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(
+      tool,
+      async (received) => {
+        let status = {};
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          status = JSON.parse((await tool.execute({ action: "status" })).text);
+          if (status.freshClients.length > 0 && status.client !== undefined) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const field = (name) => status[name] ?? status.client?.[name];
+        assert.equal(field("lastLoadedAt"), lastLoadedAt, "the tool status JSON must expose lastLoadedAt");
+        assert.equal(field("contentSource"), contentSource, "the tool status JSON must expose contentSource");
+        assert.equal(field("lastLoadFailureStale"), true, "the tool status JSON must expose lastLoadFailureStale");
+        assert.equal(received.at(-1).type, "status");
+      },
+      { statusLastLoadedAt: lastLoadedAt, statusContentSource: contentSource, statusLastLoadFailureStale: true },
+    );
+  });
+});
+
+test("0.2.13 host preview: warns when a directory has no index.html and no file is given", async () => {
+  const bare = mkdtempSync(join(tmpdir(), "dsh-bc-preview-bare-"));
+  writeFileSync(join(bare, "notes.txt"), "notes only");
+  const withIndex = mkdtempSync(join(tmpdir(), "dsh-bc-preview-index-"));
+  writeFileSync(join(withIndex, "index.html"), "<title>index</title><h1>ok</h1>");
+  const withFile = mkdtempSync(join(tmpdir(), "dsh-bc-preview-file-"));
+  writeFileSync(join(withFile, "readme.md"), "# readme");
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(tool, async (received) => {
+      const warned = await tool.execute({ action: "preview", dir: bare });
+      assert.match(warned.text, /preview served:/u, "the normal receipt must still be there");
+      assert.match(warned.text, /no index\.html/u, `the receipt must warn about the missing index.html, got: ${warned.text}`);
+      assert.match(
+        warned.text,
+        /directory listing is disabled/u,
+        "the warning must explain that the panel shows a not-found page instead of a listing",
+      );
+
+      const indexed = await tool.execute({ action: "preview", dir: withIndex });
+      assert.match(indexed.text, /preview served:/u);
+      assert.ok(!/no index\.html/u.test(indexed.text), "a directory with index.html must not warn about a missing index");
+
+      const filed = await tool.execute({ action: "preview", dir: withFile, file: "readme.md" });
+      assert.match(filed.text, /preview served:/u);
+      assert.match(filed.text, /root file: readme\.md/u, "the existing file receipt must stay unchanged");
+      assert.ok(!/no index\.html/u.test(filed.text), "an explicit root file must not warn about index.html");
+
+      assert.deepEqual(
+        received.map((command) => command.type),
+        ["open", "open", "open"],
+        "each preview must navigate the panel once",
+      );
+    });
   });
 });

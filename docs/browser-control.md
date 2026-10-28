@@ -1166,3 +1166,61 @@ browser <action>: no connected client — the Agent Browser sidebar panel is not
 
 结论：0.2.11 与 0.2.12 真机 PASS，二者不再标注「真机待验」；残余风险只剩壳侧上游 TODO（typed
 `did-fail-load`、只读代理、静态路径策略）。
+
+### 34.18 status 新鲜度/内容来源字段与 preview 无 index 提示（2026-10-28，0.2.12 → 0.2.13）
+
+0.2.11 + 0.2.12 真机 PASS（§34.17）后，dsh-sidebar-ux 会话对完整 action 面做了一轮补充真机 QA
+（desktop profile，GUI origin `http://127.0.0.1:65254`，fresh client `bc-s9bn4rf8`）——**全部 PASS**：
+
+| 能力 | 覆盖 | 结果 |
+|---|---|---|
+| `setContent` | 3 种内容：minimal / doctype+inline style / 150 行 6089px 长文档 | 均秒级返回 `rendered in place`；`evaluate` 确认 title/h1；URL 保持 in-place；重复 setContent 后 `status` 仍 connected，`open`/`close`/`preview` 正常；6089px 文档 `fullPage` = 575x6089（9 segments，967ms） |
+| `screenshot` | viewport 575x742；fullPage（example.com 777px / 2 segments）；clip 320x200；375x800 mobile | 全部成功；devicePixelRatio 如实报 1 |
+| `qa` | 一次调用 4 variants（1280/375 × light/dark） | metrics 表正确（375 文档 375x951、无水平溢出、fonts loaded、console 0/0），输出 4 张 png |
+| `preview` | 无 index 的根目录；`file=README.md` | 无 index 时页面内 "not found"（无目录列表，可接受）；README.md 以 text/markdown 正确返回 |
+| `emulate` | dark → light → auto | dark：matchMedia dark + html bg rgb(34,34,34)；light：rgb(238,238,238)；auto 恢复系统 dark；2 stylesheets、0 patched（matchMedia 路径生效） |
+| evaluate / metrics / wait / logs | 常规调用 | 正常；wait selector + networkIdle 324ms 命中 |
+| `viewport` | 375x800 + `scrollbars:"hidden"`；reset 575x742 | contentWidth 375（对齐）；reset 回执带 15px classic scrollbar 说明 |
+| 0.2.11 回执 | `open http://127.0.0.1:55545/` | 干净 `ERR_CONNECTION_REFUSED (-102)`、无 IPC 包装；`status.attemptedUrl`/`lastLoadFailure.at`/`hostOrigin` 正确 |
+| DSH-origin 隔离回归 | 127.0.0.1:65254 / localhost:65254 | 两者均显式拦截且端口动态；example.com 不受影响 |
+
+补充 QA 的 3 个非阻塞观察 → 0.2.13：
+
+1. **`lastLoadFailure` 过期不刷新**：后续成功导航后该字段仍保留旧失败（`at` 不变），agent 可能
+   误判当前面板坏了。0.2.13 加 `lastLoadedAt`（最近一次真实加载成功时间）与计算字段
+   `lastLoadFailureStale`（`lastLoadedAt > lastLoadFailure.at` 时为 true），**保留** raw
+   `lastLoadFailure` 作诊断。
+2. **setContent 后 `lastUrl`/`lastTitle` 不同源**：`lastUrl` 停在上一个导航 URL，`lastTitle` 已是
+   setContent 写入文档的标题。0.2.13 加 `contentSource: "navigation" | "setContent"`
+   （首个内容前为 undefined），让 agent 知道这两个字段是否描述同一文档。
+3. **preview 无 index 仍称 "navigated"**：未传 `file` 且目录无 `index.html` 时面板实际显示 not-found，
+   但回执仍泛称已导航。0.2.13 Host 在打开成功后追加
+   `note: <dir> has no index.html and directory listing is disabled, so the panel shows a
+   not-found page; pass file=<name> or add index.html.`
+
+0.2.13 实现契约（client.js + index.js；全部为 additive 字段/提示，不改既有行为）：
+
+- client 状态新增 `lastLoadedAt` / `contentSource`：`open`/`navigate` 的 `loaded:true` 成功后、
+  `setContent` 正常成功与 probe-fallback 成功后、以及 `click` 产生导航（`navigated === true`）后
+  更新；`loaded:false`（Chromium 错误页）分支**不**更新（保留旧值）。
+- `status()` 增加 `lastLoadedAt`、`contentSource`、`lastLoadFailureStale`（仅在失败存在且其后有
+  成功加载时为 `true`，否则省略该键，保持 JSON 小）。
+- Host `executeStatus()` pass-through 三个字段；工具 DESCRIPTION 的 status 句补
+  `lastLoadedAt`/`lastLoadFailureStale` 与 `contentSource` 说明。
+- Host `executePreview()`：打开成功后，若未指定 `file` 且 `join(dir, "index.html")` 不存在，
+  回执末尾追加上述 note（其余回执文本不变；`existsSync` 来自 node:fs）。
+- 测试：新增 7 项（156 → **163 项全绿**）：成功 open/setContent 的 contentSource/lastLoadedAt、
+  后续成功使失败变 stale（raw failure 保留）、click 导航标记、错误页不计成功导航、Host status
+  pass-through、preview 无 index 警告（有 index 或 file 指向存在文件时不误报）。
+- 真机待验（下次重启生效）：profile 仍是 0.2.12 安装副本，0.2.13 需同步/remove+add 后重启
+  DSH Desktop。复验清单：
+  1) 成功 open 后 `status` 含 `contentSource:"navigation"` + `lastLoadedAt`（number）；
+  2) `setContent` 后 `status.contentSource:"setContent"`，`lastUrl`/`lastTitle` 不同源时可由
+     `contentSource` 解释；
+  3) 先制造 `ERR_CONNECTION_REFUSED` 失败再成功 open → `lastLoadFailure` 保留、
+     `lastLoadFailureStale:true`；
+  4) `preview {dir:<无 index 目录>}` 回执含 `no index.html`/`directory listing is disabled` note；
+     `preview {dir, file:"README.md"}` 与含 index 的目录不出现该 note；
+  5) 0.2.11/0.2.12 已真机 PASS 的行为（结构化失败回执、隔离拒绝、setContent 秒级返回、看门狗）
+     不回归。
+  本轮未重启、未做 0.2.13 真机验证（0.2.11/0.2.12 已真机 PASS）。

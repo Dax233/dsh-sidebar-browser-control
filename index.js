@@ -18,7 +18,7 @@
  */
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createBridge } from "./bridge.js";
 import { createPreviewServer } from "./lib/preview.js";
 
@@ -73,7 +73,7 @@ const CLIENT_FRESH_MS = 60_000;
 const DESCRIPTION =
   "Drive the Agent Browser in the DSH sidebar: a real Chromium webview that the user can watch, with a visible agent cursor that never moves the user's mouse. " +
   "Workflow: action=open with a URL (opens recovers once from a stale never-ready panel by remounting; still failing asks for close/open), then action=snapshot to read the page (visible interactive elements get refs), then action=click/type by ref; call snapshot again after each action that changes the page. Refs are only valid for the most recent snapshot. " +
-  "QA actions: viewport {width,height,reset,scrollbars} sets the real CSS viewport (the panel scales to fit), optionally hides the page scrollbars, and reports actual innerWidth/innerHeight + contentWidth (classic scrollbar note), evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence (fullPage scroll-stitches viewport captures with per-stage diagnostics and step timeouts, then reports timings; a taller-than-viewport element is scroll-stitched instead of clipped; fixed/sticky elements may repeat), emulate {colorScheme} applies a best-effort light/dark preference with a DOM fallback for native <picture>/<source media> and <link media> (including open shadow roots), setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state and its JSON exposes the attempted open/navigate URL, the guest's last load failure (lastLoadFailure) and (in DSH Desktop) the blocked DSH Host origin so the shell isolation can be predicted instead of hit. " +
+  "QA actions: viewport {width,height,reset,scrollbars} sets the real CSS viewport (the panel scales to fit), optionally hides the page scrollbars, and reports actual innerWidth/innerHeight + contentWidth (classic scrollbar note), evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence (fullPage scroll-stitches viewport captures with per-stage diagnostics and step timeouts, then reports timings; a taller-than-viewport element is scroll-stitched instead of clipped; fixed/sticky elements may repeat), emulate {colorScheme} applies a best-effort light/dark preference with a DOM fallback for native <picture>/<source media> and <link media> (including open shadow roots), setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state and its JSON exposes the attempted open/navigate URL, the guest's last load failure (lastLoadFailure, with lastLoadedAt/lastLoadFailureStale telling a stale failure from a live one), contentSource (\"navigation\" or \"setContent\") and (in DSH Desktop) the blocked DSH Host origin so the shell isolation can be predicted instead of hit. " +
   "Boundaries: only http(s) navigation — file:// is blocked by the desktop shell (use setContent or preview); the desktop shell also isolates the Agent Browser from the DSH Host itself — loading the Host's own origin (any loopback hostname on the Host's port) is refused with a policy error instead of a bare ERR_FAILED (-2); use setContent/preview for local content, or a separate standalone 'dsh web' instance to inspect the GUI; deviceScaleFactor/DPR cannot be emulated (no CDP from a renderer <webview>) and screenshots report their real pixel size instead; emulate is best-effort (matchMedia shim + same-origin media-rule rewrite; cross-origin stylesheets cannot be patched); there is no offscreen/CI mode — qa runs in the visible panel. Screenshots save to disk; call read_image with the returned path. Coordinates are CSS pixels inside the page viewport.";
 
 function requireHttpUrl(raw, field) {
@@ -935,6 +935,9 @@ export function apply(ctx) {
         status.lastUrl = clientValue.lastUrl;
         status.lastTitle = clientValue.lastTitle;
         if (clientValue.lastLoadFailure !== undefined) status.lastLoadFailure = clientValue.lastLoadFailure;
+        if (clientValue.lastLoadedAt !== undefined) status.lastLoadedAt = clientValue.lastLoadedAt;
+        if (clientValue.contentSource !== undefined) status.contentSource = clientValue.contentSource;
+        if (clientValue.lastLoadFailureStale !== undefined) status.lastLoadFailureStale = clientValue.lastLoadFailureStale;
         if (clientValue.attemptedUrl !== undefined) status.attemptedUrl = clientValue.attemptedUrl;
         if (clientValue.hostOrigin !== undefined) status.hostOrigin = clientValue.hostOrigin;
       } else {
@@ -949,12 +952,19 @@ export function apply(ctx) {
     if (!(await waitForClient(1500))) return { text: noClientText("preview") };
     let session;
     let created = false;
+    let noIndexNote;
     try {
       const ensured = await ensurePreview(command);
       session = ensured.session;
       created = ensured.created;
       const opened = await push("open", { type: "open", url: session.url }, COMMAND_TIMEOUT_MS);
       requireOk(opened, "preview open");
+      // The preview server answers the bare base URL with index.html or a 404
+      // (directory listing is disabled). Without a root file the panel really
+      // shows a not-found page, so do not claim the content was opened.
+      if (command.file === undefined && !existsSync(join(session.dir, "index.html"))) {
+        noIndexNote = `note: ${session.dir} has no index.html and directory listing is disabled, so the panel shows a not-found page; pass file=<name> or add index.html.`;
+      }
     } catch (error) {
       if (created && session !== undefined) {
         const failed = session;
@@ -972,7 +982,8 @@ export function apply(ctx) {
         `preview served: ${session.url}\n` +
         `directory: ${session.dir}${command.file ? ` (root file: ${command.file})` : ""}\n` +
         `${created ? "started" : "reused"} a 127.0.0.1 static server with a random token path; GET/HEAD only, no directory listing. ` +
-        "The panel was navigated to it. The server closes when the plugin is disposed.",
+        "The panel was navigated to it. The server closes when the plugin is disposed." +
+        (noIndexNote === undefined ? "" : `\n${noIndexNote}`),
     };
   }
 

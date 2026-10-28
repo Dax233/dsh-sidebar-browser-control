@@ -1427,6 +1427,10 @@ window.__ModuleLoader__.load({
       let lastAttempt;
       /** Last did-fail-load observed on the guest (diagnoses cancelled loads). */
       let lastLoadFailure;
+      /** When a real page load last succeeded (open/navigate/click/setContent). */
+      let lastLoadedAt;
+      /** What produced the current document: "navigation" | "setContent". */
+      let contentSource;
       /** Ring buffer of webview console-message events (≤ consoleLimit). */
       const consoleLog = [];
       const consoleCounts = { error: 0, warning: 0 };
@@ -2605,6 +2609,8 @@ window.__ModuleLoader__.load({
                 warning: `the guest did not load ${failure.validatedURL ?? url} (${failure.errorDescription ?? failure.errorCode}); the panel is showing Chromium's error page`,
               };
             }
+            lastLoadedAt = Date.now();
+            contentSource = "navigation";
             return { ok: true, loaded: true, url: info.url || url, title: info.title, attemptedUrl: url, themeReapplied: themeState !== "auto" };
           }
           case "navigate": {
@@ -2641,6 +2647,8 @@ window.__ModuleLoader__.load({
                 warning: `the guest did not load ${failure.validatedURL ?? url} (${failure.errorDescription ?? failure.errorCode}); the panel is showing Chromium's error page`,
               };
             }
+            lastLoadedAt = Date.now();
+            contentSource = "navigation";
             return { ok: true, loaded: true, url: info.url || url, title: info.title, attemptedUrl: url, themeReapplied: themeState !== "auto" };
           }
           case "snapshot": {
@@ -2688,6 +2696,8 @@ window.__ModuleLoader__.load({
               // A click can replace the document (link/form); the theme shim
               // lives on window and must be replayed on the new context.
               lastNavigation = { url: info.url, title: info.title };
+              lastLoadedAt = Date.now();
+              contentSource = "navigation";
               await replayTheme(current);
             }
             return {
@@ -3079,6 +3089,8 @@ window.__ModuleLoader__.load({
               if (probe === undefined) return { ok: false, error: contentTimeoutMessage };
               lastSnapshot = undefined;
               lastNavigation = { url: probe.url ?? "", title: probe.title ?? "" };
+              lastLoadedAt = Date.now();
+              contentSource = "setContent";
               return {
                 ...probe,
                 ok: true,
@@ -3093,6 +3105,8 @@ window.__ModuleLoader__.load({
             }
             lastSnapshot = undefined;
             lastNavigation = { url: result?.url ?? "", title: result?.title ?? "" };
+            lastLoadedAt = Date.now();
+            contentSource = "setContent";
             if (themeState !== "auto") {
               try {
                 await current.executeJavaScript(emulateJs(themeState));
@@ -3275,6 +3289,13 @@ window.__ModuleLoader__.load({
           // standalone 'dsh web' exposes no transport, so this is undefined.
           hostOrigin: desktopTransport()?.streamBaseUrl,
           lastLoadFailure,
+          // Successful-load bookkeeping: lets an agent tell a stale failure from
+          // a live one, and tells which source produced the current document
+          // (a navigation URL vs setContent's written page).
+          lastLoadedAt,
+          contentSource,
+          lastLoadFailureStale:
+            lastLoadFailure !== undefined && lastLoadedAt !== undefined && lastLoadedAt > lastLoadFailure.at ? true : undefined,
         };
       }
 

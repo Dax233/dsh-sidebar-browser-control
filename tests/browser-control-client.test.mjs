@@ -2007,3 +2007,101 @@ test("0.2.12 client setContent: without desktop transport the about:blank reset 
   assert.deepEqual(mounted.calls.loadURL, ["about:blank"]);
   mounted.controller.unmount();
 });
+
+// ---------------------------------------------------------------------------
+// 0.2.13 status freshness/content-source fields.
+// `lastLoadFailure` is deliberately retained as a diagnostic, so it can look
+// current long after a later successful load; `lastLoadedAt` +
+// `lastLoadFailureStale` let an agent tell a stale failure from a live one.
+// `contentSource` explains why lastUrl/lastTitle can disagree after setContent.
+// ---------------------------------------------------------------------------
+
+test("0.2.13 client status: a successful open marks contentSource navigation and lastLoadedAt", async () => {
+  const mounted = await mountController();
+  const before = mounted.controller.status();
+  assert.equal(before.contentSource, undefined, "no content source before any content action");
+  assert.equal(before.lastLoadedAt, undefined, "no load timestamp before any content action");
+  const result = await mounted.controller.handle({ type: "open", url: "https://example.org/loaded" });
+  assert.equal(result.ok, true);
+  assert.equal(result.loaded, true);
+  const status = mounted.controller.status();
+  assert.equal(status.contentSource, "navigation", "a real load must be reported as navigation content");
+  assert.equal(typeof status.lastLoadedAt, "number", "a real load must record when it happened");
+  assert.ok(status.lastLoadedAt > 0);
+  assert.equal(status.lastLoadFailureStale, undefined, "no recorded failure means nothing can be stale");
+  mounted.controller.unmount();
+});
+
+test("0.2.13 client status: a successful setContent marks contentSource setContent and lastLoadedAt", async () => {
+  const mounted = await mountController();
+  const result = await mounted.controller.handle({ type: "setContent", html: "<title>local</title>" });
+  assert.equal(result.ok, true);
+  const status = mounted.controller.status();
+  assert.equal(status.contentSource, "setContent", "rendered HTML is not a navigation");
+  assert.equal(typeof status.lastLoadedAt, "number", "rendered content counts as a real content load");
+  mounted.controller.unmount();
+});
+
+test("0.2.13 client status: a later successful load makes the retained failure stale", async () => {
+  const mounted = await mountController();
+  const failureUrl = "http://127.0.0.1:55545/";
+  mounted.element.dispatch("did-fail-load", {
+    errorCode: -102,
+    errorDescription: "ERR_CONNECTION_REFUSED",
+    validatedURL: failureUrl,
+    isMainFrame: true,
+  });
+  const failed = mounted.controller.status();
+  assert.ok(failed.lastLoadFailure, "the failure must be kept as a diagnostic");
+  assert.equal(failed.lastLoadFailure.errorCode, -102);
+  assert.ok(
+    failed.lastLoadFailureStale === undefined || failed.lastLoadFailureStale === false,
+    "a failure with no later successful load is current, not stale",
+  );
+  // Date.now() resolution is 1ms: a real gap keeps the ordering unambiguous.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const loaded = await mounted.controller.handle({ type: "open", url: "https://example.org/recovered" });
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.loaded, true);
+  const status = mounted.controller.status();
+  assert.ok(status.lastLoadFailure, "the diagnostic failure must be retained after the later success");
+  assert.equal(status.lastLoadFailure.errorCode, -102);
+  assert.equal(status.lastLoadFailureStale, true, "a load that succeeded after the failure makes it stale");
+  assert.equal(status.contentSource, "navigation");
+  assert.equal(typeof status.lastLoadedAt, "number");
+  mounted.controller.unmount();
+});
+
+test("0.2.13 client status: a click that navigates marks contentSource navigation", async () => {
+  const mounted = await mountController({ webviewOptions: { clickNavigates: true } });
+  const result = await mounted.controller.handle({ type: "click", ref: "e0" });
+  assert.equal(result.ok, true);
+  assert.equal(result.navigated, true, "the mock click must trigger a navigation for this assertion");
+  const status = mounted.controller.status();
+  assert.equal(status.contentSource, "navigation", "a click-driven navigation is navigation content too");
+  assert.equal(typeof status.lastLoadedAt, "number");
+  mounted.controller.unmount();
+});
+
+test("0.2.13 client status: an error-page load does not count as a successful navigation", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  const target = "http://127.0.0.1:55545/";
+  mounted.element.loadURL = async (url) => {
+    mounted.calls.loadURL.push(url);
+    // loadURL resolves, but the guest only ever shows Chromium's error page.
+    mounted.element.dispatch("did-fail-load", {
+      errorCode: -102,
+      errorDescription: "ERR_CONNECTION_REFUSED",
+      validatedURL: url,
+      isMainFrame: true,
+    });
+  };
+  const result = await mounted.controller.handle({ type: "open", url: target });
+  assert.equal(result.ok, true);
+  assert.equal(result.loaded, false, "the error page is not a successful load");
+  const status = mounted.controller.status();
+  assert.equal(status.contentSource, undefined, "an error-page load must not claim navigation content");
+  assert.equal(status.lastLoadedAt, undefined, "an error-page load must not record a successful load time");
+  assert.ok(status.lastLoadFailure, "the failure must stay visible as a diagnostic");
+  mounted.controller.unmount();
+});
