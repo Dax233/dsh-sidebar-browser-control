@@ -1139,3 +1139,30 @@ browser <action>: no connected client — the Agent Browser sidebar panel is not
   4) 0.2.11 的隔离错误/结构化失败回执不回归。
   本轮未重启、未做 0.2.12 真机验证。报告与 backlog 见本地
   `dsh-plugins/research/browser-host-block-followup-2026-10-28.md` 的「0.2.12：setContent 死锁与命令看门狗」一节。
+
+### 34.17 0.2.11 + 0.2.12 真机验收（2026-10-28 17:19，重启后；两项 PASS）
+
+环境：desktop profile 安装副本已同步到 0.2.12（直接文件同步，未走 remove/add），重启后 GUI origin
+`http://127.0.0.1:65254`；`browser status` 只有 1 个 client `bc-s9bn4rf8`（无累积）。
+
+0.2.11 验收（`attemptedUrl` / `hostOrigin` / 结构化失败回执）：
+
+| 调用 | 真机结果 |
+|---|---|
+| `browser status`（首次） | `hostOrigin: "http://127.0.0.1:65254"`（0.2.10 无此字段，证明 0.2.11 已加载） |
+| `browser open http://127.0.0.1:55545/`（无监听） | `browser open failed: ERR_CONNECTION_REFUSED (-102) loading 'http://127.0.0.1:55545/' — see action=status lastLoadFailure for the guest's last load failure.` —— 干净错误码，**无 `Error invoking remote method` / `GUEST_VIEW_MANAGER_CALL` 包装** |
+| 紧接 `browser status` | `lastLoadFailure: {errorCode:-102, errorDescription:"ERR_CONNECTION_REFUSED", validatedURL:"http://127.0.0.1:55545/", isMainFrame:true, at:…}`；`attemptedUrl: "http://127.0.0.1:55545/"` —— 失败后 `lastUrl` 仍停在旧页时也能关联本次尝试 |
+| `browser open http://127.0.0.1:65254/` | 0.2.10 隔离拒绝不回归：`blocked by the desktop shell's isolation policy … (http://127.0.0.1:65254) … ERR_FAILED (-2) … (target: …)`，端口动态 |
+| `browser open https://example.com/` | 正常 opened（不误拦） |
+
+0.2.12 验收（setContent 桌面安全 + 命令看门狗）：
+
+| 调用 | 真机结果 |
+|---|---|
+| `setContent`（完整 doctype/inline 样式，两次） | 两次均秒级返回：`setContent: "<title>" in the current context — viewport 575x742 (rendered in place of the current page (about:blank navigation was unavailable))` —— `context:"in-place"`，**无 bridge timeout** |
+| 两次 setContent 后 `browser status` | 仍 `client.ready:true / hasWebview:true / freshClients:["bc-s9bn4rf8"]`，无 stale client / no connected client |
+| 之后 `open`（example.org / example.com）、`close` + `open` 重挂载、`preview`（随机 loopback 端口 61065 的 tokenized URL，snapshot 可读） | 全部正常，面板不再需要手动重开 |
+| **看门狗真机验证**：`evaluate {expression:"new Promise(() => {})"}` 人为挂死 | Host 25s 后返回 `browser evaluate failed: browser bridge: no client result before timeout — the sidebar client did not answer in time (the panel may be wedged); the bridge stays alive, retry action=status, or action=close then action=open.`；随后 `browser status` 仍 fresh/connected，`browser open https://example.com/` 成功 —— **不再出现 stale client / no-connected-client 死锁**（这正是 dsh-sidebar-ux 会话在 0.2.10 上遇到的故障形态） |
+
+结论：0.2.11 与 0.2.12 真机 PASS，二者不再标注「真机待验」；残余风险只剩壳侧上游 TODO（typed
+`did-fail-load`、只读代理、静态路径策略）。
