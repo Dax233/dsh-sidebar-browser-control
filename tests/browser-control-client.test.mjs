@@ -1286,8 +1286,12 @@ test("open surfaces a close/open recovery hint after one remount and the floatin
     loaded.flushTimers();
     await flushMicrotasks();
   }
-  await assert.rejects(
-    () => openPromise,
+  // 0.2.11: open/navigate report failures as a {ok:false} receipt instead of
+  // throwing, so the actionable close/open hint must ride the resolved error.
+  const result = await openPromise;
+  assert.equal(result?.ok, false, "an open that never becomes ready must be reported as a failure, not a hang");
+  assert.match(
+    result.error,
     /close the Agent Browser tab and call action=open/,
     "the caller must get an actionable close/open hint, not a bare timeout",
   );
@@ -1672,5 +1676,181 @@ test("status records the guest's last did-fail-load failure", async () => {
   // Only an explicit isMainFrame:false counts as a subframe failure.
   mounted.element.dispatch("did-fail-load", { errorCode: -105, errorDescription: "NAME_NOT_RESOLVED", isMainFrame: false });
   assert.equal(mounted.controller.status().lastLoadFailure.isMainFrame, false);
+  mounted.controller.unmount();
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.11 structured open/navigate failure receipts.
+// A refused guest load surfaces in Electron as the raw IPC wrapper
+// "Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error: ERR_... (-N)
+// loading '<url>'"; the client must normalize it, keep the attempted URL, and
+// never report a navigation that only reached Chromium's error page as loaded.
+// ---------------------------------------------------------------------------
+
+/** An unlistened loopback port: the shell does not block it, the load refuses. */
+const UNAVAILABLE_URL = "http://127.0.0.1:55545/";
+
+/** Exactly the wrapper the desktop shell surfaces for a failed guest load. */
+function guestViewManagerFailure(url) {
+  return new Error(
+    `Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error: ERR_CONNECTION_REFUSED (-102) loading '${url}'`,
+  );
+}
+
+/** main-frame did-fail-load payload for a refused connection. */
+function refusedConnectionEvent(url) {
+  return { errorCode: -102, errorDescription: "ERR_CONNECTION_REFUSED", validatedURL: url, isMainFrame: true };
+}
+
+/** The agent-facing error must be a clean Chromium failure, never the IPC wrapper. */
+function assertNormalizedLoadError(result, url) {
+  assert.equal(typeof result.error, "string", `a failed load must carry a string error, got ${JSON.stringify(result)}`);
+  assert.ok(
+    result.error.includes("ERR_CONNECTION_REFUSED (-102)"),
+    `the normalized error must keep the Chromium code, got: ${result.error}`,
+  );
+  assert.ok(result.error.includes(url), `the normalized error must keep the attempted URL, got: ${result.error}`);
+  assert.ok(
+    !result.error.includes("Error invoking remote method"),
+    `the raw Electron IPC wrapper must not reach the agent, got: ${result.error}`,
+  );
+  assert.ok(
+    !result.error.includes("GUEST_VIEW_MANAGER_CALL"),
+    `the raw GUEST_VIEW_MANAGER_CALL text must not reach the agent, got: ${result.error}`,
+  );
+}
+
+/** The recorded did-fail-load shape attached to a failed load result. */
+function assertRecordedFailure(failure, url) {
+  assert.ok(failure !== undefined && failure !== null, "the result must carry the recorded loadFailure");
+  const recorded = plain(failure);
+  assert.equal(recorded.errorCode, -102);
+  assert.equal(recorded.errorDescription, "ERR_CONNECTION_REFUSED");
+  assert.equal(recorded.validatedURL, url);
+  assert.equal(recorded.isMainFrame, true);
+  assert.equal(typeof recorded.at, "number", "the failure must record when it happened");
+}
+
+test("0.2.11 client open: a rejected loadURL resolves ok:false with a normalized error and attemptedUrl", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  mounted.element.loadURL = async (url) => {
+    mounted.calls.loadURL.push(url);
+    throw guestViewManagerFailure(url);
+  };
+  const result = await mounted.controller.handle({ type: "open", url: UNAVAILABLE_URL });
+  assert.equal(result.ok, false, `a failed load must resolve ok:false instead of throwing, got ${JSON.stringify(result)}`);
+  assertNormalizedLoadError(result, UNAVAILABLE_URL);
+  assert.equal(result.attemptedUrl, UNAVAILABLE_URL, "the receipt must name the URL the panel tried to load");
+  mounted.controller.unmount();
+});
+
+test("0.2.11 client navigate: a rejected loadURL resolves the same normalized failure", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  mounted.element.loadURL = async (url) => {
+    mounted.calls.loadURL.push(url);
+    throw guestViewManagerFailure(url);
+  };
+  const result = await mounted.controller.handle({ type: "navigate", url: UNAVAILABLE_URL });
+  assert.equal(result.ok, false, `a failed navigate must resolve ok:false, got ${JSON.stringify(result)}`);
+  assertNormalizedLoadError(result, UNAVAILABLE_URL);
+  assert.equal(result.attemptedUrl, UNAVAILABLE_URL);
+  mounted.controller.unmount();
+});
+
+test("0.2.11 client: a rejection after a main-frame did-fail-load carries the recorded failure", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  mounted.element.loadURL = async (url) => {
+    mounted.calls.loadURL.push(url);
+    mounted.element.dispatch("did-fail-load", refusedConnectionEvent(url));
+    throw guestViewManagerFailure(url);
+  };
+  const result = await mounted.controller.handle({ type: "open", url: UNAVAILABLE_URL });
+  assert.equal(result.ok, false);
+  assertNormalizedLoadError(result, UNAVAILABLE_URL);
+  assert.equal(result.attemptedUrl, UNAVAILABLE_URL);
+  assertRecordedFailure(result.loadFailure, UNAVAILABLE_URL);
+  mounted.controller.unmount();
+});
+
+test("0.2.11 client open: a load that lands on Chromium's error page reports loaded:false and a warning", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  // loadURL resolves, but the guest only produced Chromium's error page.
+  mounted.element.loadURL = async (url) => {
+    mounted.calls.loadURL.push(url);
+    mounted.element.dispatch("did-fail-load", refusedConnectionEvent(url));
+  };
+  const result = await mounted.controller.handle({ type: "open", url: UNAVAILABLE_URL });
+  assert.equal(result.ok, true, `the command itself resolved, got ${JSON.stringify(result)}`);
+  assert.equal(result.loaded, false, "a navigation that only reached Chromium's error page is not a loaded page");
+  assert.equal(result.attemptedUrl, UNAVAILABLE_URL);
+  assertRecordedFailure(result.loadFailure, UNAVAILABLE_URL);
+  assert.match(String(result.warning), /ERR_CONNECTION_REFUSED|\(-102\)/u, "the warning must name the failure code");
+  assert.match(String(result.warning), /error page|Chromium/iu, "the warning must explain that the panel shows the error page");
+  mounted.controller.unmount();
+});
+
+test("0.2.11 client navigate: a load that lands on Chromium's error page reports loaded:false and a warning", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  mounted.element.loadURL = async (url) => {
+    mounted.calls.loadURL.push(url);
+    mounted.element.dispatch("did-fail-load", refusedConnectionEvent(url));
+  };
+  const result = await mounted.controller.handle({ type: "navigate", url: UNAVAILABLE_URL });
+  assert.equal(result.ok, true);
+  assert.equal(result.loaded, false);
+  assert.equal(result.attemptedUrl, UNAVAILABLE_URL);
+  assertRecordedFailure(result.loadFailure, UNAVAILABLE_URL);
+  assert.match(String(result.warning), /ERR_CONNECTION_REFUSED|\(-102\)/u);
+  assert.match(String(result.warning), /error page|Chromium/iu);
+  mounted.controller.unmount();
+});
+
+test("0.2.11 client: a successful open reports loaded:true plus attemptedUrl, and status exposes attemptedUrl/hostOrigin", async () => {
+  // A URL that differs from the mocked page's getURL() proves status() reports
+  // the requested/attempted URL, not the page that ended up loaded.
+  const requested = "https://example.org/attempted-path";
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  const result = await mounted.controller.handle({ type: "open", url: requested });
+  assert.equal(result.ok, true);
+  assert.equal(result.loaded, true, "a clean load must be reported as loaded");
+  assert.equal(result.attemptedUrl, requested);
+  assert.deepEqual(mounted.calls.loadURL, [requested]);
+  const status = mounted.controller.status();
+  assert.equal(status.attemptedUrl, requested, "status must expose the last attempted open/navigate URL");
+  assert.equal(status.hostOrigin, DSH_TRANSPORT.streamBaseUrl, "desktop shell status must expose the DSH Host origin");
+  mounted.controller.unmount();
+
+  // Standalone 'dsh web' knows no Host origin; the field must stay absent.
+  const standalone = await mountController();
+  const standaloneUrl = "https://example.org/standalone";
+  const standaloneResult = await standalone.controller.handle({ type: "open", url: standaloneUrl });
+  assert.equal(standaloneResult.ok, true);
+  assert.equal(standaloneResult.loaded, true);
+  assert.equal(standaloneResult.attemptedUrl, standaloneUrl);
+  const standaloneStatus = standalone.controller.status();
+  assert.equal(standaloneStatus.attemptedUrl, standaloneUrl);
+  assert.equal(standaloneStatus.hostOrigin, undefined, "standalone 'dsh web' must not invent a Host origin");
+  standalone.controller.unmount();
+});
+
+test("0.2.11 client: a load failure recorded before this attempt does not taint a later successful open", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  // A previous guest load failed (kept in status as a diagnostic)...
+  mounted.element.dispatch("did-fail-load", {
+    errorCode: -2,
+    errorDescription: "ERR_FAILED",
+    validatedURL: "http://127.0.0.1:55544/",
+    isMainFrame: true,
+  });
+  // ...but this open starts strictly later, so its clean load must stay clean.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  mounted.element.loadURL = async (url) => {
+    mounted.calls.loadURL.push(url);
+  };
+  const result = await mounted.controller.handle({ type: "open", url: "https://example.org/fresh" });
+  assert.equal(result.ok, true);
+  assert.equal(result.loaded, true, "a stale failure must not mark this attempt as an error-page load");
+  assert.equal(result.loadFailure, undefined, "only failures recorded during this attempt are attached to the receipt");
+  assert.equal(result.warning, undefined, "a clean load must not carry an error-page warning");
   mounted.controller.unmount();
 });

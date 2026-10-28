@@ -73,7 +73,7 @@ const CLIENT_FRESH_MS = 60_000;
 const DESCRIPTION =
   "Drive the Agent Browser in the DSH sidebar: a real Chromium webview that the user can watch, with a visible agent cursor that never moves the user's mouse. " +
   "Workflow: action=open with a URL (opens recovers once from a stale never-ready panel by remounting; still failing asks for close/open), then action=snapshot to read the page (visible interactive elements get refs), then action=click/type by ref; call snapshot again after each action that changes the page. Refs are only valid for the most recent snapshot. " +
-  "QA actions: viewport {width,height,reset,scrollbars} sets the real CSS viewport (the panel scales to fit), optionally hides the page scrollbars, and reports actual innerWidth/innerHeight + contentWidth (classic scrollbar note), evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence (fullPage scroll-stitches viewport captures with per-stage diagnostics and step timeouts, then reports timings; a taller-than-viewport element is scroll-stitched instead of clipped; fixed/sticky elements may repeat), emulate {colorScheme} applies a best-effort light/dark preference with a DOM fallback for native <picture>/<source media> and <link media> (including open shadow roots), setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state. " +
+  "QA actions: viewport {width,height,reset,scrollbars} sets the real CSS viewport (the panel scales to fit), optionally hides the page scrollbars, and reports actual innerWidth/innerHeight + contentWidth (classic scrollbar note), evaluate {expression} returns JSON, metrics {selectors,includeOverflow} reports layout/image/font/console numbers, wait {selector,text,networkIdle,idleMs,images,fonts,ms} polls in-page, scroll/scrollIntoView report exact positions, logs {clear,filter,limit} shows console + failed-image probes, screenshot {fullPage,clip,ref,selector,format,quality,path,hideCursor} saves PNG/JPEG evidence (fullPage scroll-stitches viewport captures with per-stage diagnostics and step timeouts, then reports timings; a taller-than-viewport element is scroll-stitched instead of clipped; fixed/sticky elements may repeat), emulate {colorScheme} applies a best-effort light/dark preference with a DOM fallback for native <picture>/<source media> and <link media> (including open shadow roots), setContent {html,baseUrl} renders self-contained HTML, preview {dir,file,port} serves a local directory over a tokenized 127.0.0.1 URL, qa {url,widths,themes,...} runs a width x theme matrix in one call, close releases the panel, status merges bridge + panel state and its JSON exposes the attempted open/navigate URL, the guest's last load failure (lastLoadFailure) and (in DSH Desktop) the blocked DSH Host origin so the shell isolation can be predicted instead of hit. " +
   "Boundaries: only http(s) navigation — file:// is blocked by the desktop shell (use setContent or preview); the desktop shell also isolates the Agent Browser from the DSH Host itself — loading the Host's own origin (any loopback hostname on the Host's port) is refused with a policy error instead of a bare ERR_FAILED (-2); use setContent/preview for local content, or a separate standalone 'dsh web' instance to inspect the GUI; deviceScaleFactor/DPR cannot be emulated (no CDP from a renderer <webview>) and screenshots report their real pixel size instead; emulate is best-effort (matchMedia shim + same-origin media-rule rewrite; cross-origin stylesheets cannot be patched); there is no offscreen/CI mode — qa runs in the visible panel. Screenshots save to disk; call read_image with the returned path. Coordinates are CSS pixels inside the page viewport.";
 
 function requireHttpUrl(raw, field) {
@@ -644,12 +644,42 @@ function buildScreenshotNotes(value) {
   return notes;
 }
 
+/**
+ * Extra receipt notes for open/navigate results (0.2.11): the URL that was
+ * actually requested when the guest resolved somewhere else, and a warning
+ * when the guest landed on Chromium's error page instead of the content.
+ */
+function loadReceiptNotes(value) {
+  const notes = [];
+  const attemptedUrl = value.attemptedUrl;
+  if (typeof attemptedUrl === "string" && attemptedUrl !== "" && attemptedUrl !== value.url) {
+    notes.push(`requested ${attemptedUrl}`);
+  }
+  const failure = value.loadFailure;
+  if (value.loaded === false && failure !== undefined && failure !== null) {
+    notes.push(
+      `warning: the guest could not load this URL (${failure.errorDescription ?? failure.errorCode}${
+        failure.errorCode !== undefined ? ` (${failure.errorCode})` : ""
+      }); the panel shows Chromium's error page (see action=status lastLoadFailure)`,
+    );
+  }
+  return notes;
+}
+
 function formatResult(action, value) {
   switch (action) {
-    case "open":
-      return `opened ${String(value.url ?? "")}${value.title ? ` (${value.title})` : ""}`;
-    case "navigate":
-      return `navigated to ${String(value.url ?? "")}${value.title ? ` (${value.title})` : ""}`;
+    case "open": {
+      const notes = loadReceiptNotes(value);
+      return `opened ${String(value.url ?? "")}${value.title ? ` (${value.title})` : ""}${
+        notes.length > 0 ? ` — ${notes.join(" — ")}` : ""
+      }`;
+    }
+    case "navigate": {
+      const notes = loadReceiptNotes(value);
+      return `navigated to ${String(value.url ?? "")}${value.title ? ` (${value.title})` : ""}${
+        notes.length > 0 ? ` — ${notes.join(" — ")}` : ""
+      }`;
+    }
     case "snapshot":
       return formatSnapshot(value);
     case "click":
@@ -898,6 +928,8 @@ export function apply(ctx) {
         status.lastUrl = clientValue.lastUrl;
         status.lastTitle = clientValue.lastTitle;
         if (clientValue.lastLoadFailure !== undefined) status.lastLoadFailure = clientValue.lastLoadFailure;
+        if (clientValue.attemptedUrl !== undefined) status.attemptedUrl = clientValue.attemptedUrl;
+        if (clientValue.hostOrigin !== undefined) status.hostOrigin = clientValue.hostOrigin;
       } else {
         status.clientError = String(clientValue?.error ?? "no client status");
       }

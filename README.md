@@ -43,8 +43,8 @@ inside the page viewport.
 
 | action | arguments | meaning |
 |---|---|---|
-| `open` | `url` | show the sidebar panel and navigate (also reopens after `close`); recovers once from a stale never-ready panel by remounting |
-| `navigate` | `url` | navigate the panel, opening it first when it is closed |
+| `open` | `url` | show the sidebar panel and navigate (also reopens after `close`); recovers once from a stale never-ready panel by remounting; a failed load returns `{ok:false, error, attemptedUrl, loadFailure}` with a normalized guest error (e.g. `ERR_CONNECTION_REFUSED (-102) loading '<url>'`) instead of Electron's raw IPC wrapper, and a navigation that lands on Chromium's error page returns `ok:true, loaded:false` with the warning instead of a bare `opened` |
+| `navigate` | `url` | navigate the panel, opening it first when it is closed; same structured failure receipt as `open` |
 | `snapshot` | – | title/url/viewport + interactive elements with refs |
 | `click` | `ref` or `x,y` | move the virtual cursor, hit-test, dispatch real mouse input |
 | `type` | `text`, optional `ref` | focus the ref (optional) and type |
@@ -52,7 +52,7 @@ inside the page viewport.
 | `scroll` | `deltaY`, optional `ref` | wheel input + script fallback; receipt has `requested/actualDelta/scrollY/scrollHeight/innerHeight/clamped/method` |
 | `scrollIntoView` | `ref` or `selector`, `block` | scroll a target into view and report the resulting position |
 | `wait` | `ms` / `selector` / `text` / `networkIdle`+`idleMs` / `images` / `fonts` | in-page polling; `ms` is the timeout when conditions are given |
-| `status` | – | bridge state merged with the panel's viewport/theme/console counters/last url + `lastLoadFailure` (`errorCode`/`errorDescription`/`validatedURL`/`isMainFrame`/`at`) as the last observed failure |
+| `status` | – | bridge state merged with the panel's viewport/theme/console counters/last url + the last `attemptedUrl`, the DSH Host `hostOrigin` (desktop only; lets an agent predict the shell isolation before hitting it) and `lastLoadFailure` (`errorCode`/`errorDescription`/`validatedURL`/`isMainFrame`/`at`) as the last observed failure |
 
 ### QA and evidence
 
@@ -130,6 +130,14 @@ browser close
   isolation. A DSH upgrade can change that shell policy or the transport
   contract: re-check this mirror after upgrading — a drift makes the guard fail
   open (the old bare `ERR_FAILED` returns) instead of over-blocking.
+  Since 0.2.11 a failed `open`/`navigate` is a structured receipt instead of
+  Electron's raw IPC text: the failure carries the requested `attemptedUrl`, a
+  normalized guest error (`ERR_CONNECTION_REFUSED (-102) loading '<url>'`,
+  dropping the `Error invoking remote method 'GUEST_VIEW_MANAGER_CALL'` wrapper)
+  and the raw `loadFailure`; a navigation that resolves onto Chromium's error
+  page returns `ok:true, loaded:false` with a warning instead of a bare `opened`;
+  and `status` exposes `attemptedUrl` plus `hostOrigin`, so the shell isolation
+  is predictable before it is hit.
 - **No offscreen / CI mode.** `qa` runs inside the visible sidebar panel; the
   plugin has no Electron main-process access and cannot render headless.
 - **`fullPage` screenshot is scroll-stitched, not a guest resize.** On the first

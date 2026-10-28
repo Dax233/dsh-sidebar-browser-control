@@ -1009,3 +1009,58 @@ isApplicationHost(url) {
 - 真机待验：profile 是 `file:` 副本安装，需要 `dsh plugin --profile desktop remove/add` 刷新
   （见索引 README「本机 profile 更换本地插件版本」）+ 重启 DSH Desktop 后才能真机复验
   （当前会话未重启，未做真机验证）。
+
+### 34.15 open/navigate 失败回执与 status 预判字段（2026-10-28，0.2.10 → 0.2.11）
+
+0.2.10 的显式隔离错误在下一次重启后做了真机验收（desktop profile，已刷新到 0.2.10 并重启；
+GUI origin `http://127.0.0.1:62109`）：
+
+| 调用 | 0.2.10 真机结果 |
+|---|---|
+| `browser open http://127.0.0.1:62109/` | `browser open failed: blocked by the desktop shell's isolation policy: the Agent Browser cannot load the DSH Host itself (http://127.0.0.1:62109); the shell cancels guest requests to the Host's own port, which Chromium reports as a bare ERR_FAILED (-2). Use action=setContent or action=preview for local content, or a separate standalone 'dsh web' instance to inspect the GUI. (target: http://127.0.0.1:62109/)` —— 端口取自 `__DSH_TRANSPORT__`，不是硬编码 |
+| `browser open http://localhost:62109/manifest.webmanifest` | 同一策略拒绝，`localhost` 目标被回显到 `(target: …)`（loopback 别名 + Host 端口判定都生效） |
+| `browser open http://127.0.0.1:55545/`（无监听） | 0.2.10 仍返回 Electron 裸 IPC 包装：`browser open failed: Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error: ERR_CONNECTION_REFUSED (-102) loading 'http://127.0.0.1:55545/'`（0.2.11 的清理对象） |
+| `browser status`（紧接着上一行） | `lastLoadFailure = {errorCode:-102, errorDescription:"ERR_CONNECTION_REFUSED", validatedURL:"http://127.0.0.1:55545/", isMainFrame:true, at:…}` —— Host 半边 pass-through 真机确认 |
+| `browser open https://example.com/` | 正常 `opened https://example.com/ (Example Domain)`，守卫不误拦 |
+
+结论：0.2.10 的「挂载前拒绝 + `status.lastLoadFailure`」真机 PASS；剩余两处体验缺口来自
+dsh-sidebar-ux 会话的反馈，由 0.2.11 修复：
+
+1. `open`/`navigate` 失败仍把 Electron 的 IPC 包装原样交给 agent（上面 55545 的例子），
+   且导航落到 Chromium 错误页时仍报 `opened`，agent 会误以为内容已加载。
+2. `status` 应暴露本次尝试的 URL 与 DSH Host origin，让 agent 预判壳隔离，而不是撞上后
+   只看裸错误。
+
+0.2.11 实现契约（client.js + index.js；不绕过壳隔离）：
+
+- client 在 `open`/`navigate` 通过隔离守卫后记录 `lastAttempt = {url, at}`；`loadFailureSince(at)`
+  只认本次尝试之后发生的 `did-fail-load`，上一次失败不会污染本次回执。
+- `describeLoadError()` 把 Electron 的
+  `Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error: ERR_CONNECTION_REFUSED (-102) loading '<url>'`
+  规范化为 `<CODE> (<numeric>) loading '<url>'`（丢弃 IPC 包装；没有错误码时原样返回）；
+  `loadFailureLine()` 用 `errorDescription (errorCode) loading 'validatedURL'` 组装回执行。
+- 加载抛错不再直接 throw：resolve `{ ok:false, error, attemptedUrl, loadFailure? }`；`error` 末尾附
+  `— see action=status lastLoadFailure …`，`ERR_FAILED` 时附「桌面壳会 cancel 部分 guest 请求」说明。
+  隔离守卫命中的拒绝保持原样（仍不 mount/load）。
+- 成功路径同样检查本次 `did-fail-load`：主 frame 失败（导航落在 Chromium 错误页）时返回
+  `{ ok:true, loaded:false, url, title, attemptedUrl, loadFailure, warning }`，不再报裸 `opened`；
+  正常加载返回 `{ ok:true, loaded:true, url, title, attemptedUrl }`。
+- `status()` 增加 `attemptedUrl`（最近一次 open/navigate 请求的 URL）与 `hostOrigin`
+  （`desktopTransport()?.streamBaseUrl`；standalone `dsh web` 无 transport → undefined，JSON 丢弃）。
+- Host 半边 `formatResult("open"/"navigate")` 追加 `requested <attemptedUrl>`（请求与实际落点不同时）
+  与错误页 warning（含 `ERR_…` 错误码 + `see action=status lastLoadFailure`）；`executeStatus()`
+  pass-through `attemptedUrl`/`hostOrigin`；工具 DESCRIPTION 的 status 句补三条字段。
+- 兼容：0.2.10 的隔离守卫与 `loadUrlWithRecovery()` 的 must-be-attached 重建重试都不变；
+  非桌面环境没有 `hostOrigin`，行为与 0.2.10 相同。
+- 测试：新增 11 项（136 → **147 项全绿**），覆盖 IPC 包装规范化（结果不含 `Error invoking remote
+  method`/`GUEST_VIEW_MANAGER_CALL`，含 `ERR_CONNECTION_REFUSED (-102)` 与 URL）、loadURL reject +
+  本次 `did-fail-load` 的 `loadFailure`、错误页 `loaded:false` + warning、正常 `loaded:true`、
+  `status.attemptedUrl`/`hostOrigin` 及无 transport 时的缺省、Host 回执 `requested`/warning 与
+  `executeStatus()` pass-through、工具 DESCRIPTION 措辞。
+- 真机待验（下次重启生效）：profile 是 `file:` 副本安装，本轮由维护会话直接把 0.2.11 文件同步进
+  安装副本（内容等价于 remove/add 后的结果，下次重启加载；也可按索引 README 的 remove/add 流程刷新）；
+  复验 `browser open http://127.0.0.1:55545/` 应返回 `{ok:false}` + `attemptedUrl` +
+  `ERR_CONNECTION_REFUSED (-102)`（无 IPC 包装文本），`browser status` 应含
+  `attemptedUrl`/`hostOrigin`/`lastLoadFailure`，且 0.2.10 已真机验证的隔离拒绝与 example.com
+  正常路径不回归。真机证据与剩余 backlog 见本地
+  `dsh-plugins/research/browser-host-block-followup-2026-10-28.md`（gitignored）。

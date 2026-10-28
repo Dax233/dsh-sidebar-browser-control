@@ -313,6 +313,8 @@ function startFakeClient(port, received, isStopped, options = {}) {
           ...(options.statusLastLoadFailure !== undefined
             ? { lastLoadFailure: options.statusLastLoadFailure }
             : {}),
+          ...(options.statusAttemptedUrl !== undefined ? { attemptedUrl: options.statusAttemptedUrl } : {}),
+          ...(options.statusHostOrigin !== undefined ? { hostOrigin: options.statusHostOrigin } : {}),
         };
       default:
         return { ok: true };
@@ -957,6 +959,89 @@ test("0.2.10 browser tool description documents the DSH Host isolation", () => {
     for (const phrase of ["desktop shell", "DSH Host", "ERR_FAILED"]) {
       assert.ok(description.includes(phrase), `the browser tool description must mention "${phrase}"`);
     }
+  } finally {
+    harness.disposeAll();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.11 structured open/navigate failure receipts + status preflight fields.
+// The client now reports loaded:false (with the recorded load failure and the
+// attempted URL) instead of a bare "opened", and status exposes the attempted
+// URL plus the DSH Host origin; the host must render/forward all of it.
+// ---------------------------------------------------------------------------
+
+test("0.2.11 host receipts: an error-page load receipt carries a warning, the Chromium code, and the error-page hint", () => {
+  const url = "http://127.0.0.1:55545/";
+  const text = plugin.__test.formatResult("open", {
+    url,
+    title: "",
+    attemptedUrl: url,
+    loaded: false,
+    loadFailure: {
+      errorCode: -102,
+      errorDescription: "ERR_CONNECTION_REFUSED",
+      validatedURL: url,
+      isMainFrame: true,
+    },
+  });
+  assert.equal(typeof text, "string");
+  assert.match(text, /warning/u, `the receipt must warn instead of claiming success, got: ${text}`);
+  assert.match(text, /ERR_CONNECTION_REFUSED/u, `the receipt must name the Chromium error, got: ${text}`);
+  assert.match(text, /\(-102\)/u, `the receipt must keep the numeric error code, got: ${text}`);
+  assert.match(text, /error page|Chromium/iu, `the receipt must explain the panel shows Chromium's error page, got: ${text}`);
+});
+
+test("0.2.11 host receipts: an open receipt names the requested URL when the guest landed elsewhere", () => {
+  const text = plugin.__test.formatResult("open", {
+    url: "https://example.com/",
+    attemptedUrl: "https://example.org/",
+  });
+  assert.ok(
+    text.includes("requested https://example.org/"),
+    `the receipt must mention "requested https://example.org/", got: ${text}`,
+  );
+});
+
+test("0.2.11 host status: passes the client's attemptedUrl and hostOrigin through to the JSON status text", async () => {
+  const attemptedUrl = "http://127.0.0.1:55545/";
+  const hostOrigin = "http://127.0.0.1:55544";
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(
+      tool,
+      async (received) => {
+        let status = {};
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          status = JSON.parse((await tool.execute({ action: "status" })).text);
+          if (status.freshClients.length > 0 && status.client !== undefined) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        assert.equal(
+          status.attemptedUrl ?? status.client?.attemptedUrl,
+          attemptedUrl,
+          "the tool status JSON must expose the client's attemptedUrl",
+        );
+        assert.equal(
+          status.hostOrigin ?? status.client?.hostOrigin,
+          hostOrigin,
+          "the tool status JSON must expose the client's hostOrigin",
+        );
+        assert.equal(received.at(-1).type, "status");
+      },
+      { statusAttemptedUrl: attemptedUrl, statusHostOrigin: hostOrigin },
+    );
+  });
+});
+
+test("0.2.11 browser tool description documents status attemptedUrl, load failure, and Host origin", () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  try {
+    const description = harness.tools[0].description;
+    assert.match(description, /attempted[^.;]{0,40}url/iu, "the description must document status.attemptedUrl");
+    assert.match(description, /load failure/iu, "the description must document the last load failure");
+    assert.match(description, /host origin/iu, "the description must document the DSH Host origin");
   } finally {
     harness.disposeAll();
   }

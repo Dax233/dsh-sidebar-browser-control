@@ -1313,6 +1313,36 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * One did-fail-load event as "<description> (<code>) loading '<url>'" — the
+     * receipt line open/navigate failures and status.lastLoadFailure report.
+     */
+    function loadFailureLine(failure, fallbackUrl) {
+      return `${failure.errorDescription ?? failure.errorCode}${
+        failure.errorCode !== undefined ? ` (${failure.errorCode})` : ""
+      } loading '${failure.validatedURL ?? fallbackUrl}'`;
+    }
+
+    /**
+     * Normalize an Electron guest load error into a load-receipt line: Electron
+     * rejects webview.loadURL() with the raw IPC wrapper
+     * "Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error:
+     * ERR_CONNECTION_REFUSED (-102) loading 'http://…/'", which is noise for the
+     * agent. When a Chromium code is present, keep only code (+ numeric) and the
+     * loading URL; otherwise return the original message unchanged.
+     */
+    function describeLoadError(error) {
+      const message = String(error?.message ?? error);
+      const code = /ERR_[A-Z0-9_]+/u.exec(message)?.[0];
+      if (code === undefined) return message;
+      const numeric = /\((-?\d+)\)/u.exec(message)?.[1];
+      const loadingUrl = /loading '([^']+)'/u.exec(message)?.[1];
+      let text = code;
+      if (numeric !== undefined) text += ` (${numeric})`;
+      if (loadingUrl !== undefined) text += ` loading '${loadingUrl}'`;
+      return text;
+    }
+
     function createPanelController(options = {}) {
       const documentRef = options.document ?? globalThis.document;
       const desktop = options.dshDesktop ?? globalThis.dshDesktop;
@@ -1348,6 +1378,8 @@ window.__ModuleLoader__.load({
       /** Page-scrollbar preference for viewport captures: "auto" (default) or "hidden". */
       let scrollbarState = "auto";
       let lastNavigation = { url: "", title: "" };
+      /** Last open/navigate attempt ({url, at}); did-fail-load events before it are stale. */
+      let lastAttempt;
       /** Last did-fail-load observed on the guest (diagnoses cancelled loads). */
       let lastLoadFailure;
       /** Ring buffer of webview console-message events (≤ consoleLimit). */
@@ -1750,23 +1782,25 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Ensure the panel is ready, then navigate. The desktop shell cancels
-       * some guest requests (its own Host port, credentialed URLs, non-http(s)
-       * schemes) and Electron then reports only a bare ERR_FAILED, so append
-       * the actionable hint while keeping loadUrlWithRecovery's rebuild retry.
+       * Ensure the panel is ready, then navigate. loadUrlWithRecovery keeps the
+       * "must be attached" rebuild retry; guest load failures (including the
+       * shell's cancelled requests, which Electron only reports as a bare
+       * ERR_FAILED) are normalized into the structured receipt by handle().
        */
       async function loadUrlWithGuidance(url) {
         await ensurePanelReady();
-        try {
-          return await loadUrlWithRecovery(url);
-        } catch (error) {
-          const message = String(error && error.message ? error.message : error);
-          if (!/ERR_FAILED/u.test(message)) throw error;
-          throw new Error(
-            `${message} — the desktop shell cancels some guest requests (its own DSH Host port, URLs with credentials, ` +
-              "non-http(s) schemes); see action=status lastLoadFailure for the guest's last load failure.",
-          );
-        }
+        return loadUrlWithRecovery(url);
+      }
+
+      /**
+       * The lastLoadFailure that belongs to the current open/navigate attempt.
+       * A failure observed before the attempt started belongs to an earlier
+       * navigation and must not be attributed to it.
+       */
+      function loadFailureSince(sinceMs) {
+        if (lastLoadFailure === undefined) return undefined;
+        if (typeof sinceMs === "number" && lastLoadFailure.at < sinceMs) return undefined;
+        return lastLoadFailure;
       }
 
       /**
@@ -2493,21 +2527,76 @@ window.__ModuleLoader__.load({
             const url = toHttpUrl(command.url);
             const refusal = loadRefusal(new URL(url));
             if (refusal !== undefined) return refusal;
-            const current = await loadUrlWithGuidance(url);
+            lastAttempt = { url, at: Date.now() };
+            const attemptAt = lastAttempt.at;
+            let current;
+            try {
+              current = await loadUrlWithGuidance(url);
+            } catch (error) {
+              // Resolve a structured failure receipt instead of throwing: the
+              // Host tool text then carries the normalized reason, not
+              // Electron's GUEST_VIEW_MANAGER_CALL IPC wrapper.
+              const failure = loadFailureSince(attemptAt);
+              const base = failure !== undefined ? loadFailureLine(failure, url) : describeLoadError(error);
+              const hint = /ERR_FAILED/u.test(String(error?.message ?? error))
+                ? " — the desktop shell cancels some guest requests (its own DSH Host port, URLs with credentials, non-http(s) schemes); see action=status lastLoadFailure for details."
+                : " — see action=status lastLoadFailure for the guest's last load failure.";
+              return { ok: false, error: base + hint, loadFailure: failure, attemptedUrl: url };
+            }
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
             await afterNavigation(current, info, url);
-            return { ok: true, url: info.url || url, title: info.title, themeReapplied: themeState !== "auto" };
+            const failure = loadFailureSince(attemptAt);
+            if (failure !== undefined && failure.isMainFrame !== false) {
+              // The navigation resolved onto Chromium's error page: report a
+              // failed load instead of claiming the requested page opened.
+              return {
+                ok: true,
+                loaded: false,
+                url: info.url || url,
+                title: info.title,
+                attemptedUrl: url,
+                loadFailure: failure,
+                warning: `the guest did not load ${failure.validatedURL ?? url} (${failure.errorDescription ?? failure.errorCode}); the panel is showing Chromium's error page`,
+              };
+            }
+            return { ok: true, loaded: true, url: info.url || url, title: info.title, attemptedUrl: url, themeReapplied: themeState !== "auto" };
           }
           case "navigate": {
             const url = toHttpUrl(command.url);
             const refusal = loadRefusal(new URL(url));
             if (refusal !== undefined) return refusal;
-            const current = await loadUrlWithGuidance(url);
+            lastAttempt = { url, at: Date.now() };
+            const attemptAt = lastAttempt.at;
+            let current;
+            try {
+              current = await loadUrlWithGuidance(url);
+            } catch (error) {
+              // Same structured receipt as open (see above).
+              const failure = loadFailureSince(attemptAt);
+              const base = failure !== undefined ? loadFailureLine(failure, url) : describeLoadError(error);
+              const hint = /ERR_FAILED/u.test(String(error?.message ?? error))
+                ? " — the desktop shell cancels some guest requests (its own DSH Host port, URLs with credentials, non-http(s) schemes); see action=status lastLoadFailure for details."
+                : " — see action=status lastLoadFailure for the guest's last load failure.";
+              return { ok: false, error: base + hint, loadFailure: failure, attemptedUrl: url };
+            }
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
             await afterNavigation(current, info, url);
-            return { ok: true, url: info.url || url, title: info.title, themeReapplied: themeState !== "auto" };
+            const failure = loadFailureSince(attemptAt);
+            if (failure !== undefined && failure.isMainFrame !== false) {
+              // Same error-page receipt as open (see above).
+              return {
+                ok: true,
+                loaded: false,
+                url: info.url || url,
+                title: info.title,
+                attemptedUrl: url,
+                loadFailure: failure,
+                warning: `the guest did not load ${failure.validatedURL ?? url} (${failure.errorDescription ?? failure.errorCode}); the panel is showing Chromium's error page`,
+              };
+            }
+            return { ok: true, loaded: true, url: info.url || url, title: info.title, attemptedUrl: url, themeReapplied: themeState !== "auto" };
           }
           case "snapshot": {
             const current = await requireReady();
@@ -3097,6 +3186,12 @@ window.__ModuleLoader__.load({
           console: { errors: consoleCounts.error, warnings: consoleCounts.warning, total: consoleTotal, buffer: consoleLog.length },
           lastUrl: lastNavigation.url || url,
           lastTitle: lastNavigation.title || lastSnapshot?.title || "",
+          // The URL of the last open/navigate attempt lets the agent compare
+          // what it asked for with where the guest actually ended up.
+          attemptedUrl: lastAttempt?.url,
+          // In DSH Desktop the shell cancels guest requests to this origin;
+          // standalone 'dsh web' exposes no transport, so this is undefined.
+          hostOrigin: desktopTransport()?.streamBaseUrl,
           lastLoadFailure,
         };
       }
@@ -3391,6 +3486,8 @@ window.__ModuleLoader__.load({
         desktopTransport,
         applicationHostBlock,
         assertLoadable,
+        describeLoadError,
+        loadFailureLine,
         staleTabIds,
         rewriteColorSchemeQuery,
         injectBaseHref,
