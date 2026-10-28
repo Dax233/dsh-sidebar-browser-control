@@ -1854,3 +1854,156 @@ test("0.2.11 client: a load failure recorded before this attempt does not taint 
   assert.equal(result.warning, undefined, "a clean load must not carry an error-page warning");
   mounted.controller.unmount();
 });
+
+// ---------------------------------------------------------------------------
+// 0.2.12 command watchdog + desktop-safe setContent.
+// Live bug: `browser setContent` on the desktop shell hung, the bridge loop
+// awaited that command forever, and every later call reported "no connected
+// client". The client now bounds every bridged command, and setContent never
+// attempts an about:blank navigation on the desktop shell (the shell only
+// admits http(s) main-frame navigation, so that load can hang).
+// ---------------------------------------------------------------------------
+
+/**
+ * Await an attempted command against a real wall-clock deadline so a wedged
+ * implementation fails the test instead of hanging the runner.
+ */
+async function settleWithin(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), ms);
+  });
+  try {
+    const settled = await Promise.race([
+      promise.then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      ),
+      deadline,
+    ]);
+    if (settled.timedOut === true) throw new Error(`${label} did not settle within ${ms}ms (the command is wedged)`);
+    if (settled.error !== undefined) throw settled.error;
+    return settled.value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("0.2.12 client watchdog: withTimeout settles with its input and clears the deadline timer", async () => {
+  const loaded = loadClientBundle(clientFile);
+  const { withTimeout } = loaded.plugin.__test;
+  assert.equal(typeof withTimeout, "function", "plugin.__test must export withTimeout");
+  assert.equal(await withTimeout(Promise.resolve("payload"), 60, "deadline must not fire"), "payload");
+  assert.equal(loaded.timers.length, 0, "a settled input must clear its deadline timer");
+  await assert.rejects(
+    () => withTimeout(Promise.reject(new Error("inner failure")), 60, "deadline must not fire"),
+    /inner failure/u,
+    "an input rejection must pass through unchanged",
+  );
+  assert.equal(loaded.timers.length, 0, "a rejected input must clear its deadline timer too");
+});
+
+test("0.2.12 client watchdog: withTimeout rejects with the given message after the deadline", async () => {
+  const loaded = loadClientBundle(clientFile);
+  const { withTimeout } = loaded.plugin.__test;
+  const outcomePromise = withTimeout(new Promise(() => {}), 60, "the page did not answer").then(
+    (value) => ({ kind: "value", value }),
+    (error) => ({ kind: "error", error }),
+  );
+  await flushMicrotasks();
+  assert.equal(loaded.timers.length, 1, "the watchdog must arm one deadline timer");
+  loaded.flushTimers();
+  const settled = await outcomePromise;
+  assert.equal(settled.kind, "error", "the deadline must reject the wrapper");
+  assert.equal(settled.error.message, "the page did not answer");
+  assert.equal(loaded.timers.length, 0, "a fired deadline must not leave a timer behind");
+});
+
+test("0.2.12 client watchdog: runCommandGuarded returns results and converts handler rejections", async () => {
+  const loaded = loadClientBundle(clientFile);
+  const { runCommandGuarded } = loaded.plugin.__test;
+  assert.equal(typeof runCommandGuarded, "function", "plugin.__test must export runCommandGuarded");
+  const resolved = await runCommandGuarded(
+    { handle: async (command) => ({ ok: true, echo: command.type }) },
+    { type: "evaluate" },
+    60,
+  );
+  assert.deepEqual(plain(resolved), { ok: true, echo: "evaluate" }, "a settled command must return the handler value");
+  assert.equal(loaded.timers.length, 0, "a settled command must clear its deadline timer");
+  const rejected = await runCommandGuarded(
+    {
+      handle: async () => {
+        throw new Error("the handler exploded");
+      },
+    },
+    { type: "evaluate" },
+    60,
+  );
+  assert.equal(rejected.ok, false, "a handler rejection must become a receipt, not a rejection");
+  assert.match(rejected.error, /the handler exploded/u);
+  assert.equal(loaded.timers.length, 0, "a failed command must clear its deadline timer too");
+});
+
+test("0.2.12 client watchdog: runCommandGuarded turns a hung handler into a wedged-panel receipt", async () => {
+  const loaded = loadClientBundle(clientFile);
+  const { runCommandGuarded } = loaded.plugin.__test;
+  // The live 0.2.11 shape: the controller accepts the command and never settles.
+  const wedged = { handle: () => new Promise(() => {}) };
+  const receiptPromise = runCommandGuarded(wedged, { type: "setContent", html: "<p>x</p>" }, 40);
+  await flushMicrotasks();
+  assert.equal(loaded.timers.length, 1, "the watchdog must arm exactly one command deadline");
+  loaded.flushTimers();
+  const receipt = await receiptPromise;
+  assert.equal(receipt?.ok, false, "a hung command must resolve a failure receipt instead of hanging the loop");
+  assert.match(String(receipt.error), /timed out after \d+ms/u, "the receipt must report the elapsed deadline");
+  assert.match(String(receipt.error), /wedged/u, "the receipt must name the wedged panel");
+  assert.match(String(receipt.error), /action=status/u, "the receipt must tell the agent how to recover");
+});
+
+test("0.2.12 client setContent: the desktop shell renders in place instead of navigating to about:blank", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT, webviewOptions: { statefulUrl: true } });
+  const result = await mounted.controller.handle({ type: "setContent", html: "<title>x</title>" });
+  assert.equal(result.ok, true);
+  assert.equal(result.context, "in-place", "the desktop shell must render in place: about:blank navigation is never admitted");
+  assert.deepEqual(mounted.calls.loadURL, [], "setContent must not call loadURL at all on the desktop shell");
+  mounted.controller.unmount();
+});
+
+test("0.2.12 client setContent: a never-settling content script still returns a bounded receipt", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT, webviewOptions: { statefulUrl: true } });
+  mounted.loaded.flushTimers(); // drain any mount-time leftovers so the first deadline timer is setContent's
+  const originalExecuteJavaScript = mounted.mock.webview.executeJavaScript;
+  mounted.element.executeJavaScript = (code) => {
+    // Only the document-replacement script hangs; diagnostics probes still work.
+    if (String(code).includes("__dshAgentSetContent")) return new Promise(() => {});
+    return originalExecuteJavaScript(code);
+  };
+  const promise = mounted.controller.handle({ type: "setContent", html: "<title>x</title>" });
+  let armed = false;
+  for (let attempt = 0; attempt < 12 && !armed; attempt += 1) {
+    await flushMicrotasks();
+    if (mounted.loaded.timers.length > 0) {
+      mounted.loaded.flushTimers();
+      armed = true;
+    }
+  }
+  assert.ok(armed, "the content render must be wrapped in a bounded deadline");
+  const result = await settleWithin(promise, 15000, "setContent");
+  if (result.ok === true) {
+    assert.equal(result.context, "in-place");
+    assert.match(String(result.warning), /completion signal/iu, "the warning must explain the lost completion signal");
+  } else {
+    assert.equal(result.ok, false);
+    assert.match(String(result.error), /timed out/iu, "a failed receipt must report the timeout");
+  }
+  mounted.controller.unmount();
+});
+
+test("0.2.12 client setContent: without desktop transport the about:blank reset path is unchanged", async () => {
+  const mounted = await mountController({ webviewOptions: { statefulUrl: true } });
+  const result = await mounted.controller.handle({ type: "setContent", html: "<title>x</title>" });
+  assert.equal(result.ok, true);
+  assert.equal(result.context, "about:blank", "standalone 'dsh web' keeps resetting the page before rendering");
+  assert.deepEqual(mounted.calls.loadURL, ["about:blank"]);
+  mounted.controller.unmount();
+});

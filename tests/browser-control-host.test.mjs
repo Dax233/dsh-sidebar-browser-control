@@ -328,6 +328,9 @@ function startFakeClient(port, received, isStopped, options = {}) {
         const message = await response.json();
         if (message && typeof message.id === "string" && message.cmd) {
           received.push(message.cmd);
+          // 0.2.12: optionally simulate a wedged client that takes the command
+          // and never posts a result (the Host must then time out with a hint).
+          if (Array.isArray(options.dropTypes) && options.dropTypes.includes(message.cmd.type)) continue;
           await fetch(`http://127.0.0.1:${port}/result?id=${encodeURIComponent(message.id)}`, {
             method: "POST",
             headers: { ...auth, "content-type": "application/json" },
@@ -1045,4 +1048,27 @@ test("0.2.11 browser tool description documents status attemptedUrl, load failur
   } finally {
     harness.disposeAll();
   }
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.12: a wedged client (takes the command, never posts a result) must give
+// the agent a recoverable timeout receipt, not just the bare bridge timeout.
+// ---------------------------------------------------------------------------
+
+test("0.2.12 host: a client that never answers reports the wedged-panel hint", async () => {
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(
+      tool,
+      async (received) => {
+        const result = await tool.execute({ action: "setContent", html: "<p>x</p>" });
+        assert.match(result.text, /no client result before timeout/u, "the original bridge timeout must still be visible");
+        assert.match(result.text, /panel may be wedged/iu, "the receipt must name the wedged panel");
+        assert.match(result.text, /action=status/u, "the receipt must tell the agent how to recover");
+        assert.equal(received[0].type, "setContent", "the command must reach the (wedged) client before timing out");
+      },
+      // The fake client takes the command but never posts a result.
+      { dropTypes: ["setContent"] },
+    );
+  });
 });

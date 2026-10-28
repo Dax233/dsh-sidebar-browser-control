@@ -343,3 +343,29 @@ test("bridge: a per-command timeout override also extends the stale queue window
     bridge.close();
   }
 });
+
+test("0.2.12 bridge: an immediately dispatched command carries its deadline", async () => {
+  // The client-side watchdog derives its per-command budget from this field, so
+  // the immediate (held-poll) dispatch path must carry the effective timeout.
+  const bridge = makeBridge({ pollTimeoutMs: 500 });
+  const port = await bridge.start();
+  try {
+    const pollPromise = authed(port, "/poll?client=c1").then((response) => response.json());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const commandPromise = bridge.pushCommand({ type: "setContent", html: "<p>x</p>" }, 5000);
+    const delivered = await pollPromise;
+    assert.ok(delivered.id, "the poll must carry a command id");
+    assert.deepEqual(delivered.cmd, { type: "setContent", html: "<p>x</p>" });
+    assert.equal(delivered.timeoutMs, 5000, "the immediate dispatch payload must carry the per-command deadline");
+    const result = await authed(port, `/result?id=${encodeURIComponent(delivered.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: true, context: "in-place" }),
+    });
+    assert.equal(result.status, 200);
+    const outcome = await commandPromise;
+    assert.equal(outcome.value.context, "in-place");
+  } finally {
+    bridge.close();
+  }
+});

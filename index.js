@@ -874,7 +874,14 @@ export function apply(ctx) {
       const outcome = await bridge.pushCommand(command, timeoutMs);
       return { value: outcome.value, latencyMs: outcome.latencyMs };
     } catch (error) {
-      return { value: { ok: false, error: String(error && error.message ? error.message : error) } };
+      let message = String(error && error.message ? error.message : error);
+      if (/no client result before timeout/iu.test(message)) {
+        // The panel stopped answering but the bridge itself is still up: say so
+        // instead of leaving the agent to guess whether the whole plugin died.
+        message +=
+          " — the sidebar client did not answer in time (the panel may be wedged); the bridge stays alive, retry action=status, or action=close then action=open.";
+      }
+      return { value: { ok: false, error: message } };
     }
   }
 

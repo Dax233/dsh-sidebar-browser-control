@@ -1064,3 +1064,78 @@ dsh-sidebar-ux 会话的反馈，由 0.2.11 修复：
   `attemptedUrl`/`hostOrigin`/`lastLoadFailure`，且 0.2.10 已真机验证的隔离拒绝与 example.com
   正常路径不回归。真机证据与剩余 backlog 见本地
   `dsh-plugins/research/browser-host-block-followup-2026-10-28.md`（gitignored）。
+
+### 34.16 setContent 死锁与命令看门狗（2026-10-28，0.2.11 → 0.2.12）
+
+0.2.11 真机试用由 dsh-sidebar-ux 会话报告：`browser setContent` 在桌面壳真机上连续两次失败，
+工具返回：
+
+```text
+browser setContent failed: browser bridge: no client result before timeout
+```
+
+之后 client 完全停止轮询：`browser status` 里只剩一个 stale client id，`open` / `close` / `preview`
+都返回：
+
+```text
+browser <action>: no connected client — the Agent Browser sidebar panel is not open. Call action=open with a URL first (or ask the user to reopen the panel).
+```
+
+面板只能手动重开恢复。约 16:55:39（本地）会话触发一次 plugin dispose/remount 后出现新的 client id
+`bc-yb2vxgkl`，`browser status` 恢复健康——说明 Host / 桥本身没死，是 guest/client 端命令卡住导致
+轮询停摆。
+
+根因分析（三处叠加）：
+
+1. **桌面壳主 frame 导航只放行 http(s)**：`setContent` 旧实现先 `await webview.loadURL("about:blank")`；
+   桌面壳的 `webRequest` / `allowedNavigation` 会 cancel 非 http(s) 主 frame 导航，但在 Electron
+   侧该 `loadURL` 可能既不 resolve 也不 reject → 命令永久挂起。
+2. **client bridge poll 循环没有看门狗**：旧 `createBridgeLoop` 直接 `await controller.handle(cmd)`，
+   一个卡死命令让整个轮询停止；Host 侧保留旧 client id，后续命令只能等到 bridge timeout，
+   表现为 `no client result before timeout`，随后新命令因 client 不再登记而报 `no connected client`。
+3. **页面脚本的双重 rAF 可能被节流**：`setContentJs()` 用
+   `requestAnimationFrame(() => requestAnimationFrame(finish))` 等文档稳定；隐藏/被遮挡的 webview
+   不保证触发 rAF，脚本可能永远不返回完成信号，即使文档已经替换成功。
+
+另外 0.2.10 / 0.2.11 的隔离错误文案推荐用 `setContent` 替代本地内容，这条建议在桌面壳上不可靠
+（上述第 1 条），本轮一并修正。
+
+0.2.12 修复契约（client.js + bridge.js + index.js；不改变 0.2.11 已有行为）：
+
+- 新增模块级 `withTimeout(promise, ms, message)`：带上限地等待任意 promise，输入 settle 时清除
+  定时器，竞速失败分支挂 noop catch，不会产生 unhandled rejection；`__test` 导出。
+- **`setContent` 在桌面壳原地渲染**：`desktopTransport() !== undefined` 时完全不尝试 `about:blank`
+  导航（`context = "in-place"`），直接 `document.open/write/close` 渲染；非桌面环境保留 about:blank
+  路径但包 `withTimeout(…, 2000)`，失败/拒绝时同样回退 in-place 并如实回执。
+- `executeJavaScript(setContentJs(...))` 包 `withTimeout(…, 8000)`；超时后用 2s 预算探测
+  `pageInfo()`：页面可读 → `{ok:true, context, warning:"setContent completion signal was lost
+  (the document was replaced); the page is readable"}`；探测也失败 →
+  `{ok:false, error:"setContent timed out after 8000ms — the guest document may be stuck; call
+  action=status, then action=setContent again or action=close and action=open"}`。命令不再可能无限挂起。
+- `setContentJs()` 的双重 rAF 改为与 `setTimeout(finish, 100)` 竞速，被节流的 webview 也能返回完成信号。
+- **bridge poll 命令看门狗**：`runCommandGuarded(controller, cmd, timeoutMs)` 有界执行
+  `controller.handle(cmd)`；超时 resolve
+  `{ok:false, error:"client command timed out after <ms>ms — the Agent Browser panel may be wedged;
+  the bridge loop stays alive, retry action=status, or action=close then action=open"}`；handler 抛错
+  也转成失败回执；该函数从不 reject，poll 循环超时后继续轮询。deadline 取 bridge 随命令下发的
+  `timeoutMs`（+3s grace，默认 45s），慢命令仍由 Host 的 bridge timeout 先报，真卡死才由看门狗切断。
+- `bridge.js` 即时派发也携带 `timeoutMs: effectiveTimeoutMs`（排队路径原本已带）。
+- `index.js` push 捕获 `no client result before timeout` 时追加
+  `— the sidebar client did not answer in time (the panel may be wedged); the bridge stays alive,
+  retry action=status, or action=close then action=open.`，不再让 agent 猜插件是否整体死掉。
+- 测试：新增 9 项（147 → **156 项全绿**）：`withTimeout` 正常/超时/清定时器、`runCommandGuarded`
+  正常/拒绝/挂死回 wedged receipt、桌面 `setContent` 不调用 `loadURL("about:blank")` 且
+  `context:"in-place"`、never-settling 内容脚本有界返回（warning 或 timeout error 均算通过）、
+  非桌面环境 about:blank 路径不变、bridge 即时派发携带 `timeoutMs`、Host 对不回应 client 的
+  wedged 提示。
+- 真机待验（下次重启生效）：profile 仍是 0.2.11 安装副本，0.2.12 需同步/remove+add 后重启
+  DSH Desktop。复验清单：
+  1) `browser setContent {html:"<h1>hi</h1>"}` 秒级返回，回执 `ok:true` 且 `context:"in-place"`，
+     不再出现 bridge timeout；
+  2) 连续两次 setContent 后 `browser status` 仍为 connected，`open`/`close`/`preview` 不再报
+     `no connected client`；
+  3) 人为让一个命令挂死时回执 `client command timed out after <ms>ms … panel may be wedged`，
+     且随后 `status` 仍 connected（轮询继续）；
+  4) 0.2.11 的隔离错误/结构化失败回执不回归。
+  本轮未重启、未做 0.2.12 真机验证。报告与 backlog 见本地
+  `dsh-plugins/research/browser-host-block-followup-2026-10-28.md` 的「0.2.12：setContent 死锁与命令看门狗」一节。

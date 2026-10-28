@@ -44,6 +44,36 @@ window.__ModuleLoader__.load({
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+    /**
+     * Settle with `promise`, or reject with `new Error(message)` after `ms`.
+     * The deadline is cleared when the input settles. A late rejection of the
+     * losing branch is swallowed so it can never surface as an unhandled
+     * rejection in the renderer.
+     */
+    function withTimeout(promise, ms, message) {
+      let timer;
+      const source = Promise.resolve(promise);
+      const guarded = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+        source.then(
+          (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        );
+      });
+      // Attach the noop catch to the losing branches: a caller that awaits the
+      // guard (and handles the rejection) still sees it, but the source promise
+      // rejecting after the deadline must not become an unhandled rejection.
+      source.catch(() => {});
+      guarded.catch(() => {});
+      return guarded;
+    }
+
     // ---------------------------------------------------------------------
     // Page scripts. Each runs inside the guest page through executeJavaScript;
     // the marker comments are also what the unit tests assert to prove the
@@ -1062,7 +1092,22 @@ window.__ModuleLoader__.load({
         document.write(HTML);
         document.close();
         await new Promise((resolve) => setTimeout(resolve, 0));
-        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        // A throttled/hidden webview may never fire requestAnimationFrame, so the
+        // double-rAF settle is raced with a bounded timer: the script must always
+        // return a completion signal.
+        await new Promise((resolve) => {
+          let waited = false;
+          let timer;
+          const finish = () => {
+            if (waited) return;
+            waited = true;
+            if (typeof clearTimeout === "function") clearTimeout(timer);
+            resolve();
+          };
+          timer = setTimeout(finish, 100);
+          const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (callback) => setTimeout(callback, 0);
+          raf(() => raf(finish));
+        });
         if (document.fonts && document.fonts.ready) {
           try { await Promise.race([document.fonts.ready, new Promise((resolve) => setTimeout(resolve, 500))]); } catch (error) {}
         }
@@ -2993,12 +3038,17 @@ window.__ModuleLoader__.load({
             const baseUrl = typeof command.baseUrl === "string" && command.baseUrl !== "" ? command.baseUrl : undefined;
             const rendered = injectBaseHref(html, baseUrl);
             let context = "about:blank";
-            if (!isBlankUrl(readUrl())) {
+            if (desktopTransport() !== undefined) {
+              // The desktop shell only admits http(s) main-frame navigation, so
+              // loadURL("about:blank") never settles there (the command used to
+              // hang). Render into the current document instead.
+              context = "in-place";
+            } else if (!isBlankUrl(readUrl())) {
               // Get to a blank document so the HTML owns the whole page; if the
               // shell/session refuses about:blank, render in place and say so.
               context = "in-place";
               try {
-                await current.loadURL("about:blank");
+                await withTimeout(current.loadURL("about:blank"), 2000);
                 for (let attempt = 0; attempt < 10; attempt += 1) {
                   await sleepImpl(150);
                   if (isBlankUrl(readUrl())) break;
@@ -3008,7 +3058,39 @@ window.__ModuleLoader__.load({
                 context = "in-place";
               }
             }
-            const result = await current.executeJavaScript(setContentJs(rendered.html));
+            let result;
+            const contentTimeoutMessage =
+              "setContent timed out after 8000ms — the guest document may be stuck; call action=status, then action=setContent again or action=close and action=open";
+            try {
+              // The document swap can destroy the execution context before the
+              // completion signal arrives; never await it unbounded.
+              result = await withTimeout(current.executeJavaScript(setContentJs(rendered.html)), 8000, contentTimeoutMessage);
+            } catch (error) {
+              if (String(error?.message ?? error) !== contentTimeoutMessage) throw error;
+              // The command timed out but the guest may still have replaced the
+              // document: probe it read-only. A readable page is a success with
+              // a warning; a dead page gets the actionable error.
+              let probe;
+              try {
+                probe = await withTimeout(pageInfo(), 2000);
+              } catch {
+                probe = undefined;
+              }
+              if (probe === undefined) return { ok: false, error: contentTimeoutMessage };
+              lastSnapshot = undefined;
+              lastNavigation = { url: probe.url ?? "", title: probe.title ?? "" };
+              return {
+                ...probe,
+                ok: true,
+                context,
+                title: probe.title ?? "",
+                url: probe.url ?? "",
+                baseUrl: baseUrl ?? null,
+                injectedBase: rendered.injected === true,
+                warning: "setContent completion signal was lost (the document was replaced); the page is readable",
+                bytes: utf8Length(html),
+              };
+            }
             lastSnapshot = undefined;
             lastNavigation = { url: result?.url ?? "", title: result?.title ?? "" };
             if (themeState !== "auto") {
@@ -3248,6 +3330,22 @@ window.__ModuleLoader__.load({
       return typeof AbortSignal.any === "function" ? AbortSignal.any([timeout, lifetime]) : lifetime;
     }
 
+    /**
+     * Run one bridge command under a watchdog and resolve its receipt. A wedged
+     * command must never stop the poll loop: a timeout resolves
+     * `{ok:false, error}` instead of hanging, and a handler that throws is
+     * converted to a failure receipt too. This function never rejects.
+     */
+    async function runCommandGuarded(controller, cmd, timeoutMs) {
+      const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 45_000;
+      const timeoutMessage = `client command timed out after ${deadline}ms — the Agent Browser panel may be wedged; the bridge loop stays alive, retry action=status, or action=close then action=open`;
+      try {
+        return await withTimeout(controller.handle(cmd), deadline, timeoutMessage);
+      } catch (error) {
+        return { ok: false, error: String(error && error.message ? error.message : error) };
+      }
+    }
+
     function createBridgeLoop(controller, lifetime) {
       const clientId = `bc-${Math.random().toString(36).slice(2, 10)}`;
       return (async () => {
@@ -3279,12 +3377,14 @@ window.__ModuleLoader__.load({
             const message = await response.json();
             backoff = 500;
             if (message && typeof message.id === "string" && message.cmd) {
-              let result;
-              try {
-                result = await controller.handle(message.cmd);
-              } catch (error) {
-                result = { ok: false, error: String(error && error.message ? error.message : error) };
-              }
+              // Give the client a small grace beyond the bridge's own command
+              // deadline so the Host still reports the bridge timeout first for
+              // a merely slow command; a truly wedged one is cut here instead of
+              // stopping the poll loop forever.
+              const requestedTimeoutMs = Number(message.timeoutMs);
+              const watchdogMs =
+                Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0 ? requestedTimeoutMs + 3000 : 45_000;
+              const result = await runCommandGuarded(controller, message.cmd, watchdogMs);
               let payload = JSON.stringify(result);
               // The bridge rejects oversized result bodies (HTTP 413) and the
               // Host would only see a timeout. Fail loudly with guidance first.
@@ -3483,6 +3583,8 @@ window.__ModuleLoader__.load({
       },
       __test: {
         createPanelController,
+        withTimeout,
+        runCommandGuarded,
         desktopTransport,
         applicationHostBlock,
         assertLoadable,

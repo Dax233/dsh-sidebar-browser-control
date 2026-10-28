@@ -64,7 +64,7 @@ inside the page viewport.
 | `logs` | `clear`, `filter`, `limit` | console-message ring buffer (≤200) + page-side failed-image/resource probe |
 | `screenshot` | `fullPage`, `clip{x,y,width,height}`, `ref`, `selector`, `format` (`png`/`jpeg`), `quality`, `path`, `hideCursor` | saves PNG/JPEG evidence and reports the real pixel size parsed from the file; `fullPage` scroll-stitches viewport captures (≤12000 CSS px; fixed/sticky elements may repeat) and reports stage diagnostics, per-step `timings` and the segment count; an element taller than the viewport (or outside it) is scroll-stitched instead of clipped (≤12000, `capped`/`croppedWidth` annotated); every stitch step has a timeout; fullPage rides a longer bridge command timeout (default 120s, `DSH_BROWSER_CONTROL_FULLPAGE_TIMEOUT_MS`) |
 | `emulate` | `colorScheme` (`light`/`dark`/`auto`) | best-effort light/dark preference: matchMedia shim, same-origin `@media (prefers-color-scheme)` rewrite, plus a DOM fallback that re-picks native `<picture><source media>` and normalizes `<link rel=stylesheet media>` (including open shadow roots, capped at 6000 nodes); counters in the receipt; fully restored by `auto`; replayed on navigation (open/navigate/click/key) |
-| `setContent` | `html`, optional `baseUrl` | render self-contained HTML (inline CSS / `data:` URLs; max 2MB) |
+| `setContent` | `html`, optional `baseUrl` | render self-contained HTML (inline CSS / `data:` URLs; max 2MB); desktop-safe since 0.2.12 — on the DSH desktop shell it renders in place instead of navigating the guest to `about:blank` (the shell only admits http(s) main-frame navigation), the document-replacement signal is bounded (8s) with a page-probe fallback, and `context` reports `in-place` (non-desktop builds keep the `about:blank` path) |
 | `preview` | `dir` (absolute), optional `file`, `port` | serve a local directory over a tokenized 127.0.0.1 URL and open it |
 | `qa` | `url`, `widths`, `themes`, `height`, `fullPage`, `scrollbars`, `maxVariants`, `outDir`, `selectors` | one call runs the width × theme matrix (≤6 variants); `scrollbars` is passed to every variant's viewport command; the result table reports viewport + content width; saves one screenshot per variant |
 | `close` | – | release the leased webview; `open` reopens |
@@ -138,6 +138,14 @@ browser close
   page returns `ok:true, loaded:false` with a warning instead of a bare `opened`;
   and `status` exposes `attemptedUrl` plus `hostOrigin`, so the shell isolation
   is predictable before it is hit.
+- **A hung client command cannot wedge the panel any more (0.2.12).** The client
+  bridge loop runs every command under a deadline instead of awaiting it
+  forever, so a hung client command can no longer wedge the panel: the loop
+  returns a timeout receipt (`client command timed out after <ms>ms …`) and keeps
+  polling, `status` stays connected and the next command still works. The
+  `setContent` hang reported on the real desktop shell is fixed too — on the DSH
+  desktop shell it renders in place (no awaited `about:blank` navigation), with
+  bounded waits and a page-probe fallback, and reports `context: "in-place"`.
 - **No offscreen / CI mode.** `qa` runs inside the visible sidebar panel; the
   plugin has no Electron main-process access and cannot render headless.
 - **`fullPage` screenshot is scroll-stitched, not a guest resize.** On the first

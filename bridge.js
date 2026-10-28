@@ -125,7 +125,10 @@ export function createBridge(options) {
     if (waiter !== undefined) {
       pollWaiters.delete(waiter);
       clearTimeout(waiter.timer);
-      waiter.respond({ id, cmd });
+      // Carry the deadline to the client too: its command watchdog must outlive
+      // the bridge timeout, so an immediate dispatch needs the same timeoutMs a
+      // queued entry already travels with.
+      waiter.respond({ id, cmd, timeoutMs: effectiveTimeoutMs });
     } else {
       queue.push({ id, cmd, queuedAt: Date.now(), timeoutMs: effectiveTimeoutMs });
     }
