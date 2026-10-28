@@ -310,6 +310,9 @@ function startFakeClient(port, received, isStopped, options = {}) {
           console: { errors: 2, warnings: 1, total: 3, buffer: 3 },
           lastUrl: "https://example.com/",
           lastTitle: "Example Domain",
+          ...(options.statusLastLoadFailure !== undefined
+            ? { lastLoadFailure: options.statusLastLoadFailure }
+            : {}),
         };
       default:
         return { ok: true };
@@ -908,4 +911,53 @@ test("0.2.4 host qa: viewport commands carry scrollbars and the result table rep
       assert.equal(viewportCommands.at(-1).reset, true, "the reset restores auto scrollbars");
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.10 desktop-shell DSH Host isolation: status pass-through + tool docs.
+// ---------------------------------------------------------------------------
+
+test("0.2.10 host status: passes the client's lastLoadFailure through to the JSON status text", async () => {
+  const lastLoadFailure = {
+    errorCode: -2,
+    errorDescription: "ERR_FAILED",
+    validatedURL: "http://127.0.0.1:55544/",
+    isMainFrame: true,
+    at: 123,
+  };
+  await withHarness(async (harness) => {
+    const tool = harness.tools[0];
+    await withFakeClient(
+      tool,
+      async () => {
+        let status = {};
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          status = JSON.parse((await tool.execute({ action: "status" })).text);
+          if (status.freshClients.length > 0 && status.client !== undefined) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const failure = status.lastLoadFailure ?? status.client?.lastLoadFailure;
+        assert.ok(failure, "the tool status JSON must expose the client's lastLoadFailure");
+        assert.equal(failure.errorCode, -2);
+        assert.equal(failure.errorDescription, "ERR_FAILED");
+        assert.equal(failure.validatedURL, "http://127.0.0.1:55544/");
+        assert.equal(failure.isMainFrame, true);
+        assert.equal(failure.at, 123);
+      },
+      { statusLastLoadFailure: lastLoadFailure },
+    );
+  });
+});
+
+test("0.2.10 browser tool description documents the DSH Host isolation", () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  try {
+    const description = harness.tools[0].description;
+    for (const phrase of ["desktop shell", "DSH Host", "ERR_FAILED"]) {
+      assert.ok(description.includes(phrase), `the browser tool description must mention "${phrase}"`);
+    }
+  } finally {
+    harness.disposeAll();
+  }
 });

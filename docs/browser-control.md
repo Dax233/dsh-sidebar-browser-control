@@ -953,3 +953,59 @@ diag：`attach-attempt 1/2/3 attached:false` → `mount-failed` → `stale-remou
 - 测试：换元素重试（新元素 ≠ 旧元素、容器只留一个）、ready-but-detached 时命令前自动重建；
   共 **125 项全绿**。
 - 真机待验（重启后）：首次 open 一次成功；若 attach 首次失败应看到 attach-attempt 后自动恢复。
+
+### 34.14 DSH Host 自身端口被桌面壳隔离（2026-10-28，0.2.9 → 0.2.10）
+
+0.2.9 真机复验通过后，试用内置浏览器自检 DSH 自己的 GUI：`browser open http://127.0.0.1:55544/`
+（当前桌面 Host 地址）失败，只返回裸 IPC 错误
+`Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error: ERR_FAILED (-2)`；
+`browser status` 只有旧的 `lastUrl`，`logs` 0 条，没有任何策略原因。对照实验：同是 loopback 的
+桥端口 `127.0.0.1:47834` 正常打开，`127.0.0.1:55545`（无监听）也返回 "opened"（错误页也算打开），
+说明 `-2` 不是网络不可达，而是被主动 cancel。
+
+根因（桌面壳有意隔离，不是插件缺陷）：`app.asar/lib/main.js` 的 `DesktopBrowserGuests.configureSession`
+在 `webRequest.onBeforeRequest` 里 cancel 所有「loopback hostname + 当前 DSH Host 端口」的请求，
+判定函数：
+
+```js
+isApplicationHost(url) {
+  const value = this.hostUrl();
+  if (value === void 0) return false;
+  const host = new URL(value);
+  return url.port === host.port && (
+    url.hostname === host.hostname ||
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
+}
+```
+
+隔离本身合理（guest 若能请求已认证的 Host，Agent 控制的页面就能拿到带 cookie 的 GUI/RPC 权限），
+但 `webRequest` cancel 在 Chromium 侧只表现为 `net::ERR_FAILED (-2)`，没有策略标识；插件 `status`
+也只记录成功导航后的 `lastUrl`，失败时没有任何可诊断线索——只能解包 `app.asar` 才知道是壳的策略。
+
+0.2.10 修复（插件侧，不绕过隔离）：
+
+- client 读 `globalThis.__DSH_TRANSPORT__.streamBaseUrl`（仅桌面壳存在）取 DSH Host origin，
+  镜像壳的判定（loopback hostname + Host 端口）；`open` / `navigate` 在 mount webview **之前**
+  命中即拒绝，不再等 Electron 抛裸 `GUEST_VIEW_MANAGER_CALL` 错误。
+- 错误文案以 `blocked by the desktop shell's isolation policy` 开头，含 DSH Host origin、
+  被拦目标（`(target: …)`）、`ERR_FAILED (-2)`，以及替代做法（`action=setContent` /
+  `action=preview` / 另起独立 `dsh web` 实例）。
+- 其它被壳 cancel 的 guest 请求（URL 带凭证；页面内导航到非 http(s) 目标等）仍会抛 `ERR_FAILED`，
+  此类错误会追加指引并提示查看 `action=status` 的 `lastLoadFailure`（`open`/`navigate` 本身在
+  `toHttpUrl` 已先拒绝非 http(s)）。
+- 非桌面壳环境（`__DSH_TRANSPORT__` 不存在或 `ownsHost !== true`）不拦截，行为与 0.2.9 相同（兼容路径）。
+- `status` 新增 `lastLoadFailure`：从 guest 的 `did-fail-load` 事件取 `errorCode` /
+  `errorDescription` / `validatedURL` / `isMainFrame` / `at`；Host 半边把它并入工具返回的
+  JSON status 文本，所以失败时也能看到原始 `-2` 原因。
+- `browser` 工具描述的 Boundaries 句补上「不能打开 DSH Host 自身 origin」这条边界。
+- 测试：新增 11 项回归测试（125 → **136 项全绿**）覆盖隔离判定/放行/兼容路径与 lastLoadFailure
+  回传；独立验收另做了「新测试跑旧代码」变异检查（恰好 7 项失败，放行/兼容用例仍通过）与
+  「壳源码逐字截取 vs 插件镜像」44 组 URL 等价比较（0 分歧，含 WHATWG 规范化与 IPv6 形态）。
+- DSH 升级后需重核壳的 `isApplicationHost` 策略与 `__DSH_TRANSPORT__` 契约：若漂移，guard 会
+  fail-open（退回裸 `ERR_FAILED`）而不会误拦，此时要同步镜像再发版。
+- 未修复（上游壳侧）：DSH Host 端口上的公开静态路径（如 `/manifest.webmanifest`、`/assets/*`）
+  同样被拦；壳侧修复（IPC 错误里带 typed 失败原因、可选的只读代理、按路径区分的策略）仍是
+  DSH Desktop 上游 TODO，本插件不尝试绕过。
+- 真机待验：profile 是 `file:` 副本安装，需要 `dsh plugin --profile desktop remove/add` 刷新
+  （见索引 README「本机 profile 更换本地插件版本」）+ 重启 DSH Desktop 后才能真机复验
+  （当前会话未重启，未做真机验证）。

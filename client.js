@@ -1252,6 +1252,67 @@ window.__ModuleLoader__.load({
       return url.href;
     }
 
+    /**
+     * DSH desktop boot facts. The shell's web frontend publishes the live Host
+     * origin on globalThis.__DSH_TRANSPORT__ ({ ownsHost, streamBaseUrl });
+     * standalone 'dsh web' does not. Read at call time (never cached): the
+     * value is installed during desktop boot, possibly after this module runs.
+     */
+    function desktopTransport() {
+      try {
+        const transport = globalThis.__DSH_TRANSPORT__;
+        if (transport === null || typeof transport !== "object") return undefined;
+        if (transport.ownsHost !== true) return undefined;
+        const streamBaseUrl = transport.streamBaseUrl;
+        if (typeof streamBaseUrl !== "string" || streamBaseUrl === "") return undefined;
+        new URL(streamBaseUrl);
+        return { ownsHost: true, streamBaseUrl };
+      } catch {
+        return undefined;
+      }
+    }
+
+    /** Hostnames the desktop shell resolves to the DSH Host itself. */
+    const LOOPBACK_HOSTNAMES = ["localhost", "127.0.0.1", "[::1]"];
+
+    /**
+     * Mirror the desktop shell's guest isolation policy exactly
+     * (DesktopBrowserGuests.configureSession in app.asar lib/main.js): every
+     * guest request whose port equals the Host port and whose hostname is the
+     * Host's own or a loopback alias is cancelled before it leaves the guest,
+     * so a webview load there can only fail with a bare ERR_FAILED (-2).
+     * Returns the policy block (Host origin + target) or undefined.
+     */
+    function applicationHostBlock(url) {
+      const transport = desktopTransport();
+      if (transport === undefined) return undefined;
+      let host;
+      try {
+        host = new URL(transport.streamBaseUrl);
+      } catch {
+        return undefined;
+      }
+      if (url.port !== host.port) return undefined;
+      if (url.hostname !== host.hostname && !LOOPBACK_HOSTNAMES.includes(url.hostname)) return undefined;
+      return { origin: host.origin, target: url.href };
+    }
+
+    /**
+     * Refuse an application-host URL with an actionable policy error before the
+     * panel mounts: Electron would only surface GUEST_VIEW_MANAGER_CALL:
+     * ERR_FAILED (-2) after the shell already cancelled the request.
+     */
+    function assertLoadable(url) {
+      const block = applicationHostBlock(url);
+      if (block === undefined) return;
+      throw new Error(
+        `blocked by the desktop shell's isolation policy: the Agent Browser cannot load the DSH Host itself (${block.origin}); ` +
+          "the shell cancels guest requests to the Host's own port, which Chromium reports as a bare ERR_FAILED (-2). " +
+          "Use action=setContent or action=preview for local content, or a separate standalone 'dsh web' instance to inspect the GUI. " +
+          `(target: ${block.target})`,
+      );
+    }
+
     function createPanelController(options = {}) {
       const documentRef = options.document ?? globalThis.document;
       const desktop = options.dshDesktop ?? globalThis.dshDesktop;
@@ -1287,6 +1348,8 @@ window.__ModuleLoader__.load({
       /** Page-scrollbar preference for viewport captures: "auto" (default) or "hidden". */
       let scrollbarState = "auto";
       let lastNavigation = { url: "", title: "" };
+      /** Last did-fail-load observed on the guest (diagnoses cancelled loads). */
+      let lastLoadFailure;
       /** Ring buffer of webview console-message events (≤ consoleLimit). */
       const consoleLog = [];
       const consoleCounts = { error: 0, warning: 0 };
@@ -1373,6 +1436,15 @@ window.__ModuleLoader__.load({
             errorDescription: event?.errorDescription,
             validatedURL: event?.validatedURL,
           });
+          // A load cancelled by the desktop shell only surfaces as a bare
+          // ERR_FAILED here, so expose the guest's last failure in status().
+          lastLoadFailure = {
+            errorCode: event?.errorCode,
+            errorDescription: event?.errorDescription,
+            validatedURL: event?.validatedURL,
+            isMainFrame: event?.isMainFrame !== false,
+            at: Date.now(),
+          };
         });
         element.addEventListener("dom-ready", () => {
           void postDiag("panel", { phase: "dom-ready", url: safePageUrl(element) });
@@ -1674,6 +1746,40 @@ window.__ModuleLoader__.load({
           const retried = await requireReady();
           await retried.loadURL(url);
           return retried;
+        }
+      }
+
+      /**
+       * Ensure the panel is ready, then navigate. The desktop shell cancels
+       * some guest requests (its own Host port, credentialed URLs, non-http(s)
+       * schemes) and Electron then reports only a bare ERR_FAILED, so append
+       * the actionable hint while keeping loadUrlWithRecovery's rebuild retry.
+       */
+      async function loadUrlWithGuidance(url) {
+        await ensurePanelReady();
+        try {
+          return await loadUrlWithRecovery(url);
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error);
+          if (!/ERR_FAILED/u.test(message)) throw error;
+          throw new Error(
+            `${message} — the desktop shell cancels some guest requests (its own DSH Host port, URLs with credentials, ` +
+              "non-http(s) schemes); see action=status lastLoadFailure for the guest's last load failure.",
+          );
+        }
+      }
+
+      /**
+       * Resolve an application-host URL to the explicit {ok:false, error}
+       * result the bridge/tool expects (the same shape unknown commands use),
+       * or undefined when the URL is loadable.
+       */
+      function loadRefusal(url) {
+        try {
+          assertLoadable(url);
+          return undefined;
+        } catch (error) {
+          return { ok: false, error: String(error && error.message ? error.message : error) };
         }
       }
 
@@ -2385,8 +2491,9 @@ window.__ModuleLoader__.load({
             return { ok: true, ...status() };
           case "open": {
             const url = toHttpUrl(command.url);
-            await ensurePanelReady();
-            const current = await loadUrlWithRecovery(url);
+            const refusal = loadRefusal(new URL(url));
+            if (refusal !== undefined) return refusal;
+            const current = await loadUrlWithGuidance(url);
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
             await afterNavigation(current, info, url);
@@ -2394,8 +2501,9 @@ window.__ModuleLoader__.load({
           }
           case "navigate": {
             const url = toHttpUrl(command.url);
-            await ensurePanelReady();
-            const current = await loadUrlWithRecovery(url);
+            const refusal = loadRefusal(new URL(url));
+            if (refusal !== undefined) return refusal;
+            const current = await loadUrlWithGuidance(url);
             await sleepImpl(Number(command.waitMs ?? 350));
             const info = await pageInfo();
             await afterNavigation(current, info, url);
@@ -2989,6 +3097,7 @@ window.__ModuleLoader__.load({
           console: { errors: consoleCounts.error, warnings: consoleCounts.warning, total: consoleTotal, buffer: consoleLog.length },
           lastUrl: lastNavigation.url || url,
           lastTitle: lastNavigation.title || lastSnapshot?.title || "",
+          lastLoadFailure,
         };
       }
 
@@ -3279,6 +3388,9 @@ window.__ModuleLoader__.load({
       },
       __test: {
         createPanelController,
+        desktopTransport,
+        applicationHostBlock,
+        assertLoadable,
         staleTabIds,
         rewriteColorSchemeQuery,
         injectBaseHref,

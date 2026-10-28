@@ -52,7 +52,7 @@ inside the page viewport.
 | `scroll` | `deltaY`, optional `ref` | wheel input + script fallback; receipt has `requested/actualDelta/scrollY/scrollHeight/innerHeight/clamped/method` |
 | `scrollIntoView` | `ref` or `selector`, `block` | scroll a target into view and report the resulting position |
 | `wait` | `ms` / `selector` / `text` / `networkIdle`+`idleMs` / `images` / `fonts` | in-page polling; `ms` is the timeout when conditions are given |
-| `status` | – | bridge state merged with the panel's viewport/theme/console counters/last url |
+| `status` | – | bridge state merged with the panel's viewport/theme/console counters/last url + `lastLoadFailure` (`errorCode`/`errorDescription`/`validatedURL`/`isMainFrame`/`at`) as the last observed failure |
 
 ### QA and evidence
 
@@ -109,6 +109,27 @@ browser close
   navigation and cancels `file:` requests, so a plugin cannot legally open local
   files. Use `setContent` for self-contained HTML, or `preview` for a local
   directory (see below).
+- **The DSH Host's own origin is blocked by the desktop shell (0.2.10).** The
+  desktop shell cancels every guest request whose hostname is loopback
+  (`localhost` / `127.0.0.1` / `[::1]`) and whose port equals the live DSH Host
+  port (`DesktopBrowserGuests.isApplicationHost`), so `open`/`navigate` to the
+  GUI you are using (e.g. `http://127.0.0.1:55544/`) used to fail with a bare
+  `Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error: ERR_FAILED (-2)`
+  and `status` showed no reason. Since 0.2.10 the client reads
+  `globalThis.__DSH_TRANSPORT__.streamBaseUrl` (desktop only), mirrors that
+  policy, and rejects `open`/`navigate` to the DSH Host *before* mounting the
+  webview: the error starts with `blocked by the desktop shell's isolation
+  policy`, names the Host origin and the blocked target (`(target: …)`), quotes
+  `ERR_FAILED (-2)`, and points at `setContent` / `preview` / a separate
+  standalone `dsh web` instance. `status` now exposes `lastLoadFailure`
+  (`errorCode`, `errorDescription`, `validatedURL`,
+  `isMainFrame`, `at`) captured from the guest's `did-fail-load` event. Public
+  static paths on the Host port remain blocked, and the shell-side fix (a typed
+  failure reason in the IPC error, an optional read-only proxy, a path-aware
+  policy) is still an upstream DSH Desktop TODO: the plugin does not bypass the
+  isolation. A DSH upgrade can change that shell policy or the transport
+  contract: re-check this mirror after upgrading — a drift makes the guard fail
+  open (the old bare `ERR_FAILED` returns) instead of over-blocking.
 - **No offscreen / CI mode.** `qa` runs inside the visible sidebar panel; the
   plugin has no Electron main-process access and cannot render headless.
 - **`fullPage` screenshot is scroll-stitched, not a guest resize.** On the first

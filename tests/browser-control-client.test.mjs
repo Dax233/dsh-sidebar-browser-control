@@ -219,6 +219,7 @@ function makeController(options = {}) {
   const loaded = loadClientBundle(clientFile, {
     webview: options.webview,
     dshDesktop: options.desktop,
+    transport: options.transport,
     ...(options.imageDecodeHangs === true ? { imageDecodeHangs: true } : {}),
     ...(options.imageOnload === true ? { imageOnload: true } : {}),
   });
@@ -253,6 +254,7 @@ async function mountController(options = {}) {
   const built = makeController({
     webview: () => mock.webview,
     desktop,
+    transport: options.transport,
     navigationWaitMs: options.navigationWaitMs ?? 0,
     ...(options.imageDecodeHangs === true ? { imageDecodeHangs: true } : {}),
     ...(options.imageOnload === true ? { imageOnload: true } : {}),
@@ -1519,5 +1521,156 @@ test("super-tall element captures stop at the 12000-cap and over-wide elements a
   const wide = await mounted.controller.handle({ type: "screenshot", selector: ".wide-tall" });
   assert.equal(wide.element.segments, 2);
   assert.equal(wide.element.croppedWidth, 525, "the part beyond the viewport width is reported as cropped");
+  mounted.controller.unmount();
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.10 desktop-shell DSH Host isolation guard + status.lastLoadFailure.
+// The shell cancels every guest request to the Host's own origin (any loopback
+// hostname on the Host port), which Chromium surfaces only as a bare
+// ERR_FAILED; the client must refuse such open/navigate commands before the
+// guest is mounted and expose the guest's last did-fail-load in status().
+// ---------------------------------------------------------------------------
+
+const DSH_HOST_ORIGIN = "http://127.0.0.1:55544";
+/** Shape the desktop shell publishes on globalThis.__DSH_TRANSPORT__. */
+const DSH_TRANSPORT = { ownsHost: true, streamBaseUrl: DSH_HOST_ORIGIN };
+
+/** Unmounted controller that simulates the desktop shell's transport marker. */
+function makeHostIsolationHarness(transport = DSH_TRANSPORT) {
+  const mock = makeWebviewMock();
+  const { desktop } = makeDshDesktop();
+  const built = makeController({ webview: () => mock.webview, desktop, transport });
+  return { ...built, calls: mock.calls };
+}
+
+/**
+ * Await an open/navigate refusal without hanging the test when the guard is
+ * missing: the legacy code path would wait for a panel that never becomes
+ * ready. Fails with the contract expectation when the command throws instead
+ * of resolving the refusal object.
+ */
+async function settleRefusal(promise) {
+  let timer;
+  const timedOut = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ kind: "timeout", value: undefined }), 400);
+  });
+  const settled = await Promise.race([
+    promise.then(
+      (value) => ({ kind: "value", value }),
+      (error) => ({ kind: "error", value: undefined, error }),
+    ),
+    timedOut,
+  ]);
+  clearTimeout(timer);
+  assert.notEqual(settled.kind, "timeout", "a refused load must settle immediately, not wait for a panel mount");
+  assert.equal(
+    settled.kind,
+    "value",
+    `a refused load must resolve {ok:false,error}, got a rejection: ${settled.error?.message ?? settled.error}`,
+  );
+  return settled.value;
+}
+
+/** Assert one desktop-shell refusal plus the no-load/no-mount guarantees. */
+function assertHostRefusal(built, result, targetUrl) {
+  assert.equal(result?.ok, false, `the refused load must resolve ok:false, got ${JSON.stringify(result)}`);
+  assert.equal(typeof result.error, "string", "the refusal must carry a string error message");
+  for (const part of ["desktop shell", DSH_HOST_ORIGIN, "ERR_FAILED", "setContent", "preview", targetUrl]) {
+    assert.ok(result.error.includes(part), `the refusal must mention "${part}", got: ${result.error}`);
+  }
+  assert.deepEqual(built.calls.loadURL, [], "a refused load must never reach webview.loadURL");
+  assert.equal(built.ensurePanelCalls(), 0, "a refused load must not open/mount the panel");
+  assert.equal(
+    built.loaded.elements.filter((element) => element.tagName === "WEBVIEW").length,
+    0,
+    "a refused load must not create the guest element either",
+  );
+}
+
+test("open refuses the DSH Host origin before loading or mounting the panel", async () => {
+  const built = makeHostIsolationHarness();
+  const target = `${DSH_HOST_ORIGIN}/`;
+  const result = await settleRefusal(built.controller.handle({ type: "open", url: target }));
+  assertHostRefusal(built, result, target);
+});
+
+test("navigate refuses the DSH Host origin with the same actionable refusal", async () => {
+  const built = makeHostIsolationHarness();
+  const target = `${DSH_HOST_ORIGIN}/assets/x.js`;
+  const result = await settleRefusal(built.controller.handle({ type: "navigate", url: target }));
+  assertHostRefusal(built, result, target);
+});
+
+test("the host guard treats localhost as the same blocked loopback host", async () => {
+  const built = makeHostIsolationHarness();
+  const target = "http://localhost:55544/manifest.webmanifest";
+  const result = await settleRefusal(built.controller.handle({ type: "open", url: target }));
+  assertHostRefusal(built, result, target);
+});
+
+test("the host guard treats [::1] as the same blocked loopback host", async () => {
+  const built = makeHostIsolationHarness();
+  const target = "http://[::1]:55544/";
+  const result = await settleRefusal(built.controller.handle({ type: "navigate", url: target }));
+  assertHostRefusal(built, result, target);
+});
+
+test("a different loopback port is allowed and reaches loadURL", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  const result = await mounted.controller.handle({ type: "open", url: "http://127.0.0.1:47834/" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(mounted.calls.loadURL, ["http://127.0.0.1:47834/"]);
+  mounted.controller.unmount();
+});
+
+test("a non-loopback hostname on the host port is allowed", async () => {
+  const mounted = await mountController({ transport: DSH_TRANSPORT });
+  const result = await mounted.controller.handle({ type: "navigate", url: "http://example.com:55544/" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(mounted.calls.loadURL, ["http://example.com:55544/"]);
+  mounted.controller.unmount();
+});
+
+test("without the desktop transport marker a loopback host URL keeps the legacy behavior", async () => {
+  // Standalone 'dsh web' (or an older shell) exposes no __DSH_TRANSPORT__: the
+  // guard must stay out of the way and the load must go through as before.
+  const mounted = await mountController();
+  const target = `${DSH_HOST_ORIGIN}/`;
+  const result = await mounted.controller.handle({ type: "open", url: target });
+  assert.equal(result.ok, true);
+  assert.deepEqual(mounted.calls.loadURL, [target]);
+  mounted.controller.unmount();
+});
+
+test("a transport that does not own the Host leaves loopback host URLs loadable", async () => {
+  const mounted = await mountController({ transport: { ownsHost: false, streamBaseUrl: DSH_HOST_ORIGIN } });
+  const target = `${DSH_HOST_ORIGIN}/`;
+  const result = await mounted.controller.handle({ type: "navigate", url: target });
+  assert.equal(result.ok, true);
+  assert.deepEqual(mounted.calls.loadURL, [target]);
+  mounted.controller.unmount();
+});
+
+test("status records the guest's last did-fail-load failure", async () => {
+  const mounted = await mountController();
+  const target = `${DSH_HOST_ORIGIN}/`;
+  mounted.element.dispatch("did-fail-load", {
+    errorCode: -2,
+    errorDescription: "ERR_FAILED",
+    validatedURL: target,
+    isMainFrame: true,
+  });
+  const status = mounted.controller.status();
+  assert.ok(status.lastLoadFailure, "status must expose lastLoadFailure after a failed guest load");
+  const failure = plain(status.lastLoadFailure);
+  assert.equal(failure.errorCode, -2);
+  assert.equal(failure.errorDescription, "ERR_FAILED");
+  assert.equal(failure.validatedURL, target);
+  assert.equal(failure.isMainFrame, true);
+  assert.equal(typeof failure.at, "number");
+  // Only an explicit isMainFrame:false counts as a subframe failure.
+  mounted.element.dispatch("did-fail-load", { errorCode: -105, errorDescription: "NAME_NOT_RESOLVED", isMainFrame: false });
+  assert.equal(mounted.controller.status().lastLoadFailure.isMainFrame, false);
   mounted.controller.unmount();
 });

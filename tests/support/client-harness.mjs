@@ -144,6 +144,9 @@ function makeElement(tag = "div") {
  * @param {object} [options]
  * @param {(call: {url: string, init: object}) => object | Promise<object>} [options.respond]
  *        returns a fetch-like response; the default answers /hello and then holds /poll forever.
+ * @param {object} [options.transport]
+ *        desktop-shell transport marker exposed as globalThis.__DSH_TRANSPORT__;
+ *        absent in standalone 'dsh web', so tests opt in explicitly.
  */
 export function loadClientBundle(clientFile, options = {}) {
   const registrations = [];
@@ -247,6 +250,9 @@ export function loadClientBundle(clientFile, options = {}) {
   sandbox.globalThis = sandbox;
   if (options.dshDesktop !== undefined) sandbox.dshDesktop = options.dshDesktop;
   if (options.notification !== undefined) sandbox.Notification = options.notification;
+  // The real DSH Desktop renderer publishes its Host origin here; standalone
+  // 'dsh web' does not, so tests must opt in to simulate the desktop shell.
+  if (options.transport !== undefined) sandbox.__DSH_TRANSPORT__ = options.transport;
 
   const context = createContext(sandbox);
   runInContext(readFileSync(clientFile, "utf8"), context, { filename: clientFile });
